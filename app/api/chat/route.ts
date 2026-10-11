@@ -176,7 +176,7 @@ export async function POST(request: NextRequest) {
       const completionBody = JSON.stringify({ model, messages, tools: toolDefinitions, tool_choice: 'auto', temperature: 0.2, max_tokens: Math.min(Number(body.maxTokens) || 8192, 32768), stream: false })
       let completion: Response | null = null
       for (let attempt = 0; attempt < 3; attempt++) {
-        completion = await fetch(`${HERMES_BASE}/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(60000), body: completionBody })
+        completion = await fetch(`${HERMES_BASE}/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(120000), body: completionBody })
         if (completion.status !== 429 || attempt === 2) break
         const retryAfter = Number(completion.headers.get('retry-after'))
         await new Promise((resolve) => setTimeout(resolve, Number.isFinite(retryAfter) ? Math.min(retryAfter * 1000, 5000) : 1000 * (attempt + 1)))
@@ -196,8 +196,8 @@ export async function POST(request: NextRequest) {
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Request failed'
     const timedOut = error instanceof DOMException && error.name === 'TimeoutError'
-    statuses.push(timedOut ? 'request timed out after 60 seconds' : 'request failed')
-    return json({ error: timedOut ? 'Hermes request timed out after 60 seconds.' : message, statuses }, { status: timedOut ? 504 : 500 })
+    statuses.push(timedOut ? 'request timed out after 120 seconds' : 'request failed')
+    return json({ error: timedOut ? 'Hermes request timed out after 120 seconds.' : message, statuses }, { status: timedOut ? 504 : 500 })
   }
 }
 
