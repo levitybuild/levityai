@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 
 const HERMES_BASE = 'https://hermes.ai.unturf.com/v1'
-const MCP_URL = process.env.LEVITY_MCP_URL
+const MCP_URL = process.env.LEVITY_MCP_URL || 'https://api.levity.click/mcp'
 
 type WorkspaceFile = { path: string; content: string }
 type ChatMessage = { role: string; content?: string; tool_calls?: unknown[]; tool_call_id?: string; name?: string }
@@ -14,7 +14,7 @@ const toolDefinitions = [
   { type: 'function', function: { name: 'apply_patch', description: 'Propose a reviewed patch. The frontend must ask the user before applying the returned diff.', parameters: { type: 'object', properties: { file: { type: 'string' }, content: { type: 'string' }, reason: { type: 'string' } }, required: ['file', 'content', 'reason'] } } },
   { type: 'function', function: { name: 'fetch_url', description: 'Fetch a URL and return status and bounded text.', parameters: { type: 'object', properties: { url: { type: 'string' }, method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'DELETE'] }, body: { type: 'string' } }, required: ['url'] } } },
   { type: 'function', function: { name: 'multi_fetch', description: 'Fetch several URLs in parallel.', parameters: { type: 'object', properties: { requests: { type: 'array', items: { type: 'object', properties: { url: { type: 'string' }, method: { type: 'string' } }, required: ['url'] } } }, required: ['requests'] } } },
-  { type: 'function', function: { name: 'run_javascript', description: 'Run a small pure JavaScript expression in a restricted context. No filesystem, network, or process access.', parameters: { type: 'object', properties: { code: { type: 'string' } }, required: ['code'] } } },
+  { type: 'function', function: { name: 'run_javascript', description: 'Run a small pure JavaScript expression for parsing, transformation, or assertions. For network endpoint tests use fetch_url or multi_fetch; process and filesystem access are intentionally unavailable.', parameters: { type: 'object', properties: { code: { type: 'string' } }, required: ['code'] } } },
   { type: 'function', function: { name: 'mcp_tools', description: 'List tools available from the configured Levity MCP endpoint.', parameters: { type: 'object', properties: {} } } },
   { type: 'function', function: { name: 'mcp_call', description: 'Call a tool on the configured Levity MCP endpoint.', parameters: { type: 'object', properties: { name: { type: 'string' }, arguments: { type: 'object' } }, required: ['name'] } } },
 ]
@@ -42,7 +42,17 @@ async function executeTool(name: string, args: Record<string, unknown>, files: W
   }
   if (name === 'multi_fetch') { const requests = Array.isArray(args.requests) ? args.requests : []; return { results: await Promise.all(requests.slice(0, 8).map((request) => executeTool('fetch_url', request as Record<string, unknown>, files)) ) } }
   if (name === 'run_javascript') { try { const code = String(args.code); if (/[;{}]|(fetch|process|globalThis|require|import|Deno|Bun|eval)/.test(code)) return { error: 'Only simple expressions are allowed.' }; return { result: Function(`"use strict"; return (${code})`)() } } catch (error) { return { error: error instanceof Error ? error.message : 'Execution failed' } } }
-  if (name === 'mcp_tools' || name === 'mcp_call') { if (!MCP_URL) return { error: 'LEVITY_MCP_URL is not configured.' }; const response = await fetch(MCP_URL, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method: name === 'mcp_tools' ? 'tools/list' : 'tools/call', params: name === 'mcp_tools' ? {} : { name: args.name, arguments: args.arguments || {} } }) }); return response.json() }
+  if (name === 'mcp_tools' || name === 'mcp_call') {
+    const request = async (method: string, params: Record<string, unknown>) => {
+      const response = await fetch(MCP_URL, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method, params }), signal: AbortSignal.timeout(15000) })
+      const text = await response.text()
+      if (!response.ok) return { error: `Levity MCP HTTP ${response.status}`, body: bounded(text, 4000) }
+      try { return JSON.parse(text) } catch { return { body: bounded(text, 12000) } }
+    }
+    await request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'levity-ai', version: '1.0.0' } })
+    await request('notifications/initialized', {})
+    return request(name === 'mcp_tools' ? 'tools/list' : 'tools/call', name === 'mcp_tools' ? {} : { name: args.name, arguments: args.arguments || {} })
+  }
   return { error: `Unknown tool: ${name}` }
 }
 
@@ -76,7 +86,7 @@ export async function POST(request: NextRequest) {
     const requestedModel = typeof body.model === 'string' && body.model !== 'loading model…' && body.model !== 'Hermes model unavailable' && body.model !== 'offline' ? body.model : null
     const model = requestedModel || await discoverModel()
     if (!model) return NextResponse.json({ error: 'Hermes did not return an available model.' }, { status: 503 })
-    const messages: ChatMessage[] = [{ role: 'system', content: `You are Levity AI, a focused coding agent. Use built-in tools when needed. Workspace access is limited to the authorized files provided. Edits are proposals and require user approval. Be concise. Current model: ${model}.` }, ...(Array.isArray(body.messages) ? body.messages : [])]
+    const messages: ChatMessage[] = [{ role: 'system', content: `You are Levity AI, a focused coding agent. Use built-in tools when needed. Workspace access is limited to the authorized files provided. Edits are proposals and require user approval. Be concise. Current model: ${model}. IMPORTANT: when the user says check Levity, inspect Levity through MCP first using mcp_tools, then mcp_call as needed. The Levity MCP endpoint is already configured at ${MCP_URL}; do not tell the user to call Levity MCP or ask them to configure it. If MCP exposes a URL or endpoint, use fetch_url or multi_fetch to inspect it further. Use fetch_url for endpoint testing and network access; do not claim run_javascript can access the process or unrestricted network.` }, ...(Array.isArray(body.messages) ? body.messages : [])]
     for (let round = 0; round < 8; round++) {
       const completionBody = JSON.stringify({ model, messages, tools: toolDefinitions, tool_choice: 'auto', temperature: 0.2, max_tokens: Math.min(Number(body.maxTokens) || 8192, 32768), stream: false })
       let completion: Response | null = null
