@@ -46,7 +46,24 @@ async function executeTool(name: string, args: Record<string, unknown>, files: W
   return { error: `Unknown tool: ${name}` }
 }
 
-export async function GET() { const [models, version] = await Promise.all([fetch(`${HERMES_BASE}/models`).then((r) => r.json()), fetch('https://hermes.ai.unturf.com/version').then((r) => r.json()).catch(() => null)]); return NextResponse.json({ provider: 'Hermes / Unturf', version, models }) }
+async function fetchJson(url: string, timeoutMs = 10000): Promise<unknown> {
+  const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs), cache: 'no-store' })
+  const text = await response.text()
+  if (!text.trim()) return null
+  try { return JSON.parse(text) } catch { return { status: response.status, raw: bounded(text, 4000) } }
+}
+
+export async function GET() {
+  try {
+    const [models, version] = await Promise.all([
+      fetchJson(`${HERMES_BASE}/models`),
+      fetchJson('https://hermes.ai.unturf.com/version').catch(() => null),
+    ])
+    return NextResponse.json({ provider: 'Hermes / Unturf', version, models })
+  } catch (error) {
+    return NextResponse.json({ error: error instanceof Error ? error.message : 'Hermes discovery failed' }, { status: 502 })
+  }
+}
 
 export async function POST(request: NextRequest) {
   try {
