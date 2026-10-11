@@ -46,20 +46,25 @@ async function executeTool(name: string, args: Record<string, unknown>, files: W
   return { error: `Unknown tool: ${name}` }
 }
 
-async function fetchJson(url: string, timeoutMs = 10000): Promise<unknown> {
-  const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs), cache: 'no-store' })
+async function fetchJson(url: string, init?: RequestInit, timeoutMs = 10000): Promise<{ response: Response; data: unknown }> {
+  const response = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs), cache: 'no-store' })
   const text = await response.text()
-  if (!text.trim()) return null
-  try { return JSON.parse(text) } catch { return { status: response.status, raw: bounded(text, 4000) } }
+  if (!text.trim()) return { response, data: null }
+  try { return { response, data: JSON.parse(text) } } catch { return { response, data: { raw: bounded(text, 4000) } } }
+}
+
+async function discoverModel(): Promise<string | null> {
+  const { response, data } = await fetchJson(`${HERMES_BASE}/models`)
+  if (!response.ok || !data || typeof data !== 'object') return null
+  const models = (data as { data?: Array<{ id?: unknown }> }).data
+  return Array.isArray(models) && typeof models[0]?.id === 'string' ? models[0].id : null
 }
 
 export async function GET() {
   try {
-    const [models, version] = await Promise.all([
-      fetchJson(`${HERMES_BASE}/models`),
-      fetchJson('https://hermes.ai.unturf.com/version').catch(() => null),
-    ])
-    return NextResponse.json({ provider: 'Hermes / Unturf', version, models })
+    const modelsResult = await fetchJson(`${HERMES_BASE}/models`, undefined, 5000)
+    if (!modelsResult.response.ok) return NextResponse.json({ error: `Hermes models request failed (${modelsResult.response.status})` }, { status: 502 })
+    return NextResponse.json({ provider: 'Hermes / Unturf', models: modelsResult.data })
   } catch (error) {
     return NextResponse.json({ error: error instanceof Error ? error.message : 'Hermes discovery failed' }, { status: 502 })
   }
@@ -68,12 +73,20 @@ export async function GET() {
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json(); const files: WorkspaceFile[] = Array.isArray(body.files) ? body.files.filter((file: WorkspaceFile) => file && typeof file.path === 'string' && typeof file.content === 'string').slice(0, 200) : []
-    const model = body.model || (await fetch(`${HERMES_BASE}/models`).then((r) => r.json())).data?.[0]?.id
-    if (!model) return NextResponse.json({ error: 'Hermes did not return a model.' }, { status: 503 })
+    const requestedModel = typeof body.model === 'string' && body.model !== 'loading model…' && body.model !== 'Hermes model unavailable' && body.model !== 'offline' ? body.model : null
+    const model = requestedModel || await discoverModel()
+    if (!model) return NextResponse.json({ error: 'Hermes did not return an available model.' }, { status: 503 })
     const messages: ChatMessage[] = [{ role: 'system', content: `You are Levity AI, a focused coding agent. Use built-in tools when needed. Workspace access is limited to the authorized files provided. Edits are proposals and require user approval. Be concise. Current model: ${model}.` }, ...(Array.isArray(body.messages) ? body.messages : [])]
     for (let round = 0; round < 8; round++) {
-      const completion = await fetch(`${HERMES_BASE}/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(30000), body: JSON.stringify({ model, messages, tools: toolDefinitions, tool_choice: 'auto', temperature: 0.2, max_tokens: Math.min(Number(body.maxTokens) || 8192, 32768), stream: false }) })
-      if (!completion.ok) return NextResponse.json({ error: `Hermes error ${completion.status}`, detail: bounded(await completion.text(), 4000) }, { status: 502 })
+      const completionBody = JSON.stringify({ model, messages, tools: toolDefinitions, tool_choice: 'auto', temperature: 0.2, max_tokens: Math.min(Number(body.maxTokens) || 8192, 32768), stream: false })
+      let completion: Response | null = null
+      for (let attempt = 0; attempt < 3; attempt++) {
+        completion = await fetch(`${HERMES_BASE}/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(30000), body: completionBody })
+        if (completion.status !== 429 || attempt === 2) break
+        const retryAfter = Number(completion.headers.get('retry-after'))
+        await new Promise((resolve) => setTimeout(resolve, Number.isFinite(retryAfter) ? Math.min(retryAfter * 1000, 5000) : 1000 * (attempt + 1)))
+      }
+      if (!completion || !completion.ok) return NextResponse.json({ error: `Hermes error ${completion?.status || 502}`, detail: bounded(await completion?.text() || 'Upstream request was throttled or unavailable.', 4000) }, { status: 502 })
       const data = await completion.json(); const assistant = data.choices?.[0]?.message; if (!assistant) return NextResponse.json({ error: 'Hermes returned no message.' }, { status: 502 })
       messages.push(assistant)
       if (!assistant.tool_calls?.length) return NextResponse.json({ model, message: assistant, rounds: round + 1 })
