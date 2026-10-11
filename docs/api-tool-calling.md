@@ -224,7 +224,7 @@ const result = await askLevity({
 })
 ```
 
-The API marks ordinary exact find/replace edits with `autoReplaceEligible: true`. Your frontend still performs the final exact-match validation. Never auto-apply a general diff or a destructive file operation. A safe dispatcher is:
+When `autoReplace: true`, the API returns `autoReplace: true`, sets `requiresApproval: false`, and sets `autoReplaceEligible: true` on every write result: `find_replace`, `diff`, and every `file_operation`. This is an explicit instruction from your frontend to apply the AI's writes without another confirmation dialog. Your frontend must still validate paths, exact match counts, collisions, and source existence. When `autoReplace: false` (or omitted), every write result has `requiresApproval: true` and must be confirmed. A dispatcher that supports both modes is:
 
 ```js
 function applyResult(result, workspace, { autoReplace }) {
@@ -240,7 +240,7 @@ For a production product, make auto mode an explicit user setting and show an ac
 
 ## 8. File operations
 
-All file operations are returned as approval-required proposals. The API never changes your frontend workspace. Each item has `type: 'file_operation'`, an `operation`, and workspace-relative paths.
+All file operations are returned as structured proposals. The API never changes your frontend workspace. Each item has `type: 'file_operation'`, an `operation`, workspace-relative paths, `requiresApproval`, and `autoReplaceEligible`. With `autoReplace: true`, these are write instructions your frontend can apply immediately; with `autoReplace: false`, they are approval-required proposals.
 
 ```js
 {
@@ -313,9 +313,71 @@ for (const operation of result.fileOperations ?? []) {
 }
 ```
 
-Do not treat `autoReplace: true` as permission to auto-apply these operations. They are destructive or structural and remain approval-required. Keep undo support and an audit log.
+`autoReplace: true` is permission to auto-apply all returned write operations, including create, clear, delete, move, move-folder, duplicate, create-folder, patch, and find/replace. This is why it must be an explicit frontend setting. Even in auto mode, validate every operation, keep undo support, and write an audit log. If `autoReplace` is false, require confirmation for every operation.
 
-## 9. Complete integration loop
+## 9. Exact AI responses for every write operation
+
+The AI does not return XML as its primary contract. The API collects tool results into JSON arrays. Always process `structuredEdits`, `fileOperations`, and `accessRequests` from the top-level response.
+
+With `autoReplace: true`, a replacement response looks like:
+
+```json
+{
+  "autoReplace": true,
+  "structuredEdits": [{
+    "type": "find_replace",
+    "file": "src/App.tsx",
+    "find": "Hello from Levity",
+    "replace": "Yodel Leviathan",
+    "expectedMatches": 1,
+    "before": "<h1>Hello from Levity</h1>",
+    "after": "<h1>Yodel Leviathan</h1>",
+    "requiresApproval": false,
+    "autoReplaceEligible": true
+  }],
+  "fileOperations": [],
+  "accessRequests": [],
+  "statuses": ["thinking", "reading current file and file structure", "preparing edit"]
+}
+```
+
+The operation response shapes are:
+
+```json
+{"type":"file_operation","operation":"create","path":"src/new.js","content":"export const value = 1;","requiresApproval":false,"autoReplaceEligible":true}
+{"type":"file_operation","operation":"clear","path":"src/old.js","requiresApproval":false,"autoReplaceEligible":true}
+{"type":"file_operation","operation":"delete","path":"src/old.js","requiresApproval":false,"autoReplaceEligible":true}
+{"type":"file_operation","operation":"create_folder","path":"src/utils","requiresApproval":false,"autoReplaceEligible":true}
+{"type":"file_operation","operation":"move","path":"src/a.js","destination":"src/b.js","requiresApproval":false,"autoReplaceEligible":true}
+{"type":"file_operation","operation":"move_folder","path":"src/old","destination":"src/new","requiresApproval":false,"autoReplaceEligible":true}
+{"type":"file_operation","operation":"duplicate","path":"src/a.js","destination":"src/a-copy.js","requiresApproval":false,"autoReplaceEligible":true}
+```
+
+When `autoReplace` is false, the same objects are returned with `requiresApproval: true` and `autoReplaceEligible: false`. The API only describes the requested mutation; your external frontend performs it.
+
+Here is a complete frontend dispatcher. It applies every write only when the response explicitly says auto mode is enabled, and otherwise calls your approval UI:
+
+```js
+function applyAIResponse(result, workspace, { confirm = window.confirm } = {}) {
+  const automatic = result.autoReplace === true
+  const approve = (item) => automatic && item.autoReplaceEligible === true && item.requiresApproval === false
+    ? true
+    : confirm(`Apply ${item.operation ?? 'edit'} to ${item.file ?? item.path}?`)
+
+  for (const edit of result.structuredEdits ?? []) {
+    if (!approve(edit)) continue
+    if (edit.type === 'find_replace') applyFindReplace(workspace, edit)
+    if (edit.type === 'diff') workspace.update(edit.file, edit.content)
+  }
+  for (const operation of result.fileOperations ?? []) {
+    if (approve(operation)) applyOperation(workspace, operation)
+  }
+}
+```
+
+`accessRequests` are not writes. Always grant file reads separately by resending the conversation with the requested file content in `files` (see section 5). Status strings are informational; render `result.statuses.at(-1)` after the response and use `Sending request…` while waiting. The API is not streamed.
+
+## 10. Complete integration loop
 
 This is a compact controller showing the recommended order: send the current file, display statuses, grant reads, review edits, and apply approved operations.
 
@@ -362,11 +424,11 @@ async function runLevity(prompt, workspace, options = {}) {
 
 In a real implementation, preserve the conversation messages and add a loop guard when continuing after a read request; the example focuses on the event flow.
 
-## 10. Security requirements
+## 11. Security requirements
 
 - Treat every path as workspace-relative. Reject absolute paths and `..` traversal.
 - Do not expose upstream provider credentials in browser code.
-- Do not auto-apply delete, clear, move, move-folder, duplicate, create, or folder operations.
+- Only auto-apply delete, clear, move, move-folder, duplicate, create, or folder operations when the request explicitly set `autoReplace: true` and the response marks the item `requiresApproval: false` and `autoReplaceEligible: true`.
 - Check source existence and destination collisions before applying.
 - Keep an undo stack and an audit log.
 - Add authentication and rate limiting before using the open-CORS endpoint with real repositories.

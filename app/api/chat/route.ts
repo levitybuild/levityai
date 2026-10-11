@@ -38,7 +38,7 @@ const toolStatus: Record<string, string> = {
   multi_fetch: 'fetching endpoints', run_javascript: 'running JavaScript', mcp_tools: 'checking Levity MCP', mcp_call: 'calling Levity MCP',
 }
 
-async function executeTool(name: string, args: Record<string, unknown>, files: WorkspaceFile[]): Promise<unknown> {
+async function executeTool(name: string, args: Record<string, unknown>, files: WorkspaceFile[], autoReplace = false): Promise<unknown> {
   if (name === 'list_files') return { files: files.map(({ path, content }) => ({ path, bytes: content.length })) }
   if (name === 'read_file') { const file = safePath(String(args.file), files); return file ? { type: 'file_access_request', action: 'read', file: file.path, requiresFrontendGrant: true, content: bounded(file.content, 30000) } : { type: 'file_access_request', action: 'read', file: String(args.file), requiresFrontendGrant: true, error: 'Frontend must grant this file before its contents are returned.' } }
   if (name === 'search_files') {
@@ -50,15 +50,15 @@ async function executeTool(name: string, args: Record<string, unknown>, files: W
     const file = safePath(String(args.file), files); if (!file) return { error: 'File is not authorized.' }
     const find = String(args.find); const matches = file.content.split(find).length - 1
     if (matches !== Number(args.expectedMatches)) return { error: `Expected ${args.expectedMatches} matches but found ${matches}. No change proposed.` }
-    return { type: 'find_replace', file: file.path, find, replace: String(args.replace), expectedMatches: matches, before: file.content, after: file.content.replace(find, String(args.replace)), requiresApproval: true, autoReplaceEligible: true }
+    return { type: 'find_replace', file: file.path, find, replace: String(args.replace), expectedMatches: matches, before: file.content, after: file.content.replace(find, String(args.replace)), requiresApproval: !autoReplace, autoReplaceEligible: true }
   }
-  if (name === 'apply_patch') return { type: 'diff', file: String(args.file), content: String(args.content), reason: String(args.reason), requiresApproval: true }
+  if (name === 'apply_patch') return { type: 'diff', file: String(args.file), content: String(args.content), reason: String(args.reason), requiresApproval: !autoReplace, autoReplaceEligible: autoReplace }
   if (['delete_file', 'clear_file', 'create_file', 'create_folder', 'move_file', 'move_folder', 'duplicate_file'].includes(name)) {
     const path = String(args.file || args.folder || '')
     const destination = args.destination ? String(args.destination) : undefined
     if ((name === 'delete_file' || name === 'clear_file' || name === 'move_file' || name === 'move_folder' || name === 'duplicate_file') && !files.some((file) => file.path === path || (name === 'move_folder' && file.path.startsWith(`${path}/`)))) return { error: 'Path is not authorized.' }
     const operation = ({ delete_file: 'delete', clear_file: 'clear', create_file: 'create', create_folder: 'create_folder', move_file: 'move', move_folder: 'move_folder', duplicate_file: 'duplicate' } as Record<string, string>)[name]
-    return { type: 'file_operation', operation, path, destination, content: name === 'create_file' ? String(args.content || '') : undefined, requiresApproval: true, autoReplaceEligible: false }
+    return { type: 'file_operation', operation, path, destination, content: name === 'create_file' ? String(args.content || '') : undefined, requiresApproval: !autoReplace, autoReplaceEligible: autoReplace }
   }
   if (name === 'fetch_url') {
     try { const response = await fetch(String(args.url), { method: String(args.method || 'GET'), body: args.body ? String(args.body) : undefined, signal: AbortSignal.timeout(10000) }); return { status: response.status, url: response.url, body: bounded(await response.text()) } } catch (error) { return { error: error instanceof Error ? error.message : 'Fetch failed' } }
@@ -122,12 +122,13 @@ export async function POST(request: NextRequest) {
   try {
     const body = await request.json(); const files: WorkspaceFile[] = Array.isArray(body.files) ? body.files.filter((file: WorkspaceFile) => file && typeof file.path === 'string' && typeof file.content === 'string').slice(0, 200) : []
     const currentFile = body.currentFile && typeof body.currentFile === 'object' && typeof body.currentFile.path === 'string' ? body.currentFile.path : typeof body.currentFile === 'string' ? body.currentFile : ''
+    const autoReplace = body.autoReplace === true
     const fileStructure = Array.isArray(body.fileStructure) ? body.fileStructure.filter((value: unknown): value is string => typeof value === 'string').slice(0, 500) : files.map((file) => file.path)
     statuses.push('reading current file and file structure')
     const requestedModel = typeof body.model === 'string' && body.model !== 'loading model…' && body.model !== 'Hermes model unavailable' && body.model !== 'offline' ? body.model : null
     const model = requestedModel || await discoverModel()
     if (!model) return json({ error: 'Hermes did not return an available model.', statuses }, { status: 503 })
-    const messages: ChatMessage[] = [{ role: 'system', content: `You are Levity AI, a focused coding agent. All tool calls happen on the API, never in the frontend. Workspace access is limited to the files provided by the frontend. The current file is ${currentFile || 'not specified'} and the file structure is ${JSON.stringify(fileStructure)}. Reading a file produces a frontend grant request; do not claim access beyond the authorized payload. Edits and file operations are proposals and require user approval. Use delete_file, clear_file, create_file, create_folder, move_file, move_folder, and duplicate_file for workspace mutations. Be concise. Current model: ${model}. When the user says check Levity, inspect the configured Levity MCP endpoint first using mcp_tools, then mcp_call as needed. The endpoint is ${MCP_URL}; never tell the user to call Levity MCP or configure it. If MCP exposes a URL or endpoint, use fetch_url or multi_fetch to inspect it further. Use fetch_url for network endpoint tests. JavaScript execution is intentionally restricted to safe expressions; never claim process or filesystem access.` }, ...(Array.isArray(body.messages) ? body.messages : [])]
+    const messages: ChatMessage[] = [{ role: 'system', content: `You are Levity AI, a focused coding agent. All tool calls happen on the API, never in the frontend. Workspace access is limited to the files provided by the frontend. The current file is ${currentFile || 'not specified'} and the file structure is ${JSON.stringify(fileStructure)}. Reading a file produces a frontend grant request; do not claim access beyond the authorized payload. Edits and file operations are proposals. When autoReplace is true, the frontend may apply every returned write operation without an additional confirmation; when false, the frontend must request approval. Use delete_file, clear_file, create_file, create_folder, move_file, move_folder, and duplicate_file for workspace mutations. Be concise. Current model: ${model}. When the user says check Levity, inspect the configured Levity MCP endpoint first using mcp_tools, then mcp_call as needed. The endpoint is ${MCP_URL}; never tell the user to call Levity MCP or configure it. If MCP exposes a URL or endpoint, use fetch_url or multi_fetch to inspect it further. Use fetch_url for network endpoint tests. JavaScript execution is intentionally restricted to safe expressions; never claim process or filesystem access.` }, ...(Array.isArray(body.messages) ? body.messages : [])]
     for (let round = 0; round < 8; round++) {
       const completionBody = JSON.stringify({ model, messages, tools: toolDefinitions, tool_choice: 'auto', temperature: 0.2, max_tokens: Math.min(Number(body.maxTokens) || 8192, 32768), stream: false })
       let completion: Response | null = null
@@ -140,9 +141,9 @@ export async function POST(request: NextRequest) {
       if (!completion || !completion.ok) return json({ error: `Hermes error ${completion?.status || 502}`, detail: bounded(await completion?.text() || 'Upstream request was throttled or unavailable.', 4000), statuses }, { status: 502 })
       const data = await completion.json(); const assistant = data.choices?.[0]?.message; if (!assistant) return NextResponse.json({ error: 'Hermes returned no message.' }, { status: 502 })
       messages.push(assistant)
-      if (!assistant.tool_calls?.length) return json({ model, message: assistant, rounds: round + 1, statuses, structuredEdits, fileOperations, accessRequests })
+      if (!assistant.tool_calls?.length) return json({ model, autoReplace, message: assistant, rounds: round + 1, statuses, structuredEdits, fileOperations, accessRequests })
       assistant.tool_calls.forEach((call: { function: { name: string } }) => { const status = toolStatus[call.function.name]; if (status) statuses.push(status) })
-      const results = await Promise.all(assistant.tool_calls.map(async (call: { id: string; function: { name: string; arguments: string } }) => { let args: Record<string, unknown>; try { args = JSON.parse(call.function.arguments || '{}') } catch { args = {} }; const result = await executeTool(call.function.name, args, files); if (result && typeof result === 'object') { if ((result as { type?: string }).type === 'find_replace' || (result as { type?: string }).type === 'diff') structuredEdits.push(result); if ((result as { type?: string }).type === 'file_operation') fileOperations.push(result as FileOperation); if ((result as { type?: string }).type === 'file_access_request') accessRequests.push(result) }; return { role: 'tool', tool_call_id: call.id, name: call.function.name, content: JSON.stringify(result) } }))
+      const results = await Promise.all(assistant.tool_calls.map(async (call: { id: string; function: { name: string; arguments: string } }) => { let args: Record<string, unknown>; try { args = JSON.parse(call.function.arguments || '{}') } catch { args = {} }; const result = await executeTool(call.function.name, args, files, autoReplace); if (result && typeof result === 'object') { if ((result as { type?: string }).type === 'find_replace' || (result as { type?: string }).type === 'diff') structuredEdits.push(result); if ((result as { type?: string }).type === 'file_operation') fileOperations.push(result as FileOperation); if ((result as { type?: string }).type === 'file_access_request') accessRequests.push(result) }; return { role: 'tool', tool_call_id: call.id, name: call.function.name, content: JSON.stringify(result) } }))
       messages.push(...results)
     }
     return NextResponse.json({ error: 'Tool loop limit reached.' }, { status: 508 })
