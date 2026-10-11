@@ -18,7 +18,62 @@ Your frontend owns the workspace. The API does not directly mutate browser files
 
 Your frontend applies approved operations to its own editor or filesystem model.
 
-## 2. CORS and endpoint discovery
+## 2. Streaming, approval policies, and endpoint discovery
+
+Set `stream: true` to receive the completed result as Server-Sent Events. The stream emits a `result` event containing the same JSON response as non-streaming mode, followed by `done`.
+
+```js
+const response = await fetch('https://your-domain.example/api/chat', {
+  method: 'POST', headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({ stream: true, currentFile, fileStructure, messages: [{ role: 'user', content: 'Inspect the app' }] }),
+})
+const reader = response.body.getReader()
+const decoder = new TextDecoder()
+let buffer = ''
+while (true) {
+  const { value, done } = await reader.read()
+  if (done) break
+  buffer += decoder.decode(value, { stream: true })
+  for (const block of buffer.split('\\n\\n').slice(0, -1)) {
+    const event = block.match(/^event: (.+)\\ndata: (.+)$/s)
+    if (!event) continue
+    const data = JSON.parse(event[2])
+    if (event[1] === 'result') renderResult(data)
+    if (event[1] === 'done') markComplete()
+  }
+  buffer = buffer.slice(buffer.lastIndexOf('\\n\\n') + 2)
+}
+```
+
+Use `approvalPolicy` to control which writes may bypass a confirmation UI. `autoReplace: true` enables writes by default; policy rules can deny or require approval for specific operations. `delete` and `move_folder` should normally remain approval-gated.
+
+```js
+{
+  autoReplace: true,
+  approvalPolicy: {
+    allow: ['find_replace', 'create', 'clear'],
+    requireApprovalFor: ['delete', 'move_folder'],
+    deny: ['duplicate']
+  }
+}
+```
+
+The API always returns `requiresApproval`, `autoReplaceEligible`, and `risk` on write results. Your frontend must enforce these fields and never apply a denied operation. `approvalPolicy` affects the returned flags; it does not mutate your workspace.
+
+```js
+function shouldApply(write, { autoReplace }) {
+  return autoReplace && write.autoReplaceEligible === true && write.requiresApproval !== true
+}
+
+for (const write of [...(result.structuredEdits ?? []), ...(result.fileOperations ?? [])]) {
+  if (shouldApply(write, request)) applyWrite(write)
+  else showApprovalCard(write)
+}
+```
+
+Supported operation names are `find_replace`, `diff`, `create`, `create_folder`, `clear`, `duplicate`, `move`, `move_folder`, and `delete`. `risk` is `low`, `medium`, or `high`; treat high-risk writes as approval-required in your own product even if your policy allows them.
+
+## 3. CORS and endpoint discovery
 
 `OPTIONS`, `GET`, and `POST /api/chat` include open CORS headers:
 
@@ -160,7 +215,24 @@ if (requested) {
 
 Keep the assistant message and prior user messages when continuing. Do not put a file into `files` merely because it appears in `fileStructure`.
 
-## 6. Find/replace proposals
+## 6. Querying files
+
+The AI can use `list_files`, `read_file`, and `search_files`. Your request should include only `fileStructure` plus the current file. When search or read needs another file, the API returns an `accessRequests` item. After your user grants it, resend the conversation with the file content in `files`.
+
+```js
+const result = await askLevity({
+  prompt: 'Find every use of fetch and tell me which files need changes',
+  currentFile,
+  fileTree,
+})
+for (const match of result.searchResults ?? []) {
+  console.log(`${match.file}:${match.line}`, match.text)
+}
+```
+
+`files` is the allowlist of content the AI may inspect. Never infer permission from a path in `fileStructure`; the path-only tree is not file access.
+
+## 7. Find/replace proposals
 
 A find/replace tool result is returned in `structuredEdits`:
 
