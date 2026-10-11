@@ -1,131 +1,375 @@
-# Levity AI editor API
+# Levity AI Editor API
 
-The API route is `POST /api/chat`. The complete implementation is in `app/api/chat/route.ts`. The preview client is `app/page.tsx`.
+This guide is the complete contract for integrating Levity AI into another JavaScript frontend. The public documentation page is:
 
-## CORS
+**`/docs`** — for example, `https://your-domain.example/docs`
 
-`OPTIONS`, `GET`, and `POST` responses include open CORS headers:
+The API endpoint is `POST /api/chat`.
 
-- `Access-Control-Allow-Origin: *`
-- `Access-Control-Allow-Methods: GET,POST,OPTIONS`
-- `Access-Control-Allow-Headers: content-type, authorization`
+## 1. What the API does
 
-This allows a personal frontend hosted on another origin to call the route. Keep upstream credentials on the server; never send Hermes or MCP secrets from the browser.
+Your frontend owns the workspace. The API does not directly mutate browser files. It receives the active file, a path-only file tree, and only the additional file contents your frontend has chosen to share. The AI returns:
 
-## Workspace visibility
+- assistant text;
+- ordered status strings;
+- structured find/replace proposals;
+- file-read permission requests;
+- file-operation proposals such as create, delete, clear, move, duplicate, and folder operations.
 
-Send the current file and path-only tree by default. Do not send unrelated file contents until the user grants a `read_file` request.
+Your frontend applies approved operations to its own editor or filesystem model.
 
-```json
-{
-  "model": "provider/model",
-  "autoReplace": false,
-  "currentFile": { "path": "src/App.tsx", "content": "..." },
-  "fileStructure": ["src/App.tsx", "src/styles.css", "src/lib/api.ts"],
-  "files": [{ "path": "src/App.tsx", "content": "..." }],
-  "messages": [{ "role": "user", "content": "Rename the heading" }]
-}
+## 2. CORS and endpoint discovery
+
+`OPTIONS`, `GET`, and `POST /api/chat` include open CORS headers:
+
+```http
+Access-Control-Allow-Origin: *
+Access-Control-Allow-Methods: GET,POST,OPTIONS
+Access-Control-Allow-Headers: content-type, authorization
 ```
 
-## Response envelope
-
-```json
-{
-  "message": { "role": "assistant", "content": "..." },
-  "statuses": ["thinking", "reading current file and file structure", "preparing edit"],
-  "structuredEdits": [],
-  "fileOperations": [],
-  "accessRequests": [],
-  "rounds": 1,
-  "model": "provider/model"
-}
-```
-
-`statuses` is ordered oldest to newest. Render the last value while the request is active, and render `ready` after applying or approving a result.
-
-## Find and replace
-
-A `find_replace` tool call returns a `structuredEdits` item with `file`, exact `find`, `replace`, `expectedMatches`, `before`, `after`, `requiresApproval`, and `autoReplaceEligible`. Validate the exact match count in your client before applying. In normal mode show a review card. In auto mode apply only when `autoReplaceEligible` is true.
-
-For text-only clients, the assistant may also emit compatibility blocks:
-
-```xml
-<find file="src/App.tsx"><![CDATA[old text]]></find>
-<replace file="src/App.tsx"><![CDATA[new text]]></replace>
-```
-
-Prefer JSON `structuredEdits` over parsing assistant text.
-
-## Read requests
-
-The API only returns content for files included in `files`. A request for another file returns:
-
-```json
-{ "type": "file_access_request", "action": "read", "file": "src/styles.css", "requiresFrontendGrant": true }
-```
-
-Show a permission prompt. After approval, resubmit the request with that file added to `files`; the server does not read the browser filesystem.
-
-## File operations
-
-The model can request these operations. Every operation is returned in `fileOperations` and is approval-required by default:
-
-- `delete`: remove `path`.
-- `clear`: preserve `path` and replace its content with an empty string.
-- `create`: add `path` with `content`.
-- `create_folder`: create an empty folder marker or directory entry in your own workspace model.
-- `move`: rename one file from `path` to `destination`.
-- `move_folder`: rewrite every descendant path from `path/` to `destination/`.
-- `duplicate`: copy `path` to `destination` without changing the source.
-
-Example:
-
-```json
-{
-  "type": "file_operation",
-  "operation": "duplicate",
-  "path": "src/App.tsx",
-  "destination": "src/App.backup.tsx",
-  "requiresApproval": true,
-  "autoReplaceEligible": false
-}
-```
-
-A client should either render an approval card and apply the operation after confirmation, or explicitly enable an operation policy for its own trusted environment. The preview uses the same `autoReplace` switch for convenience, but destructive operations are never marked auto-replace eligible by the API, so a production client should require a separate explicit policy for them.
-
-## Client application rules
-
-1. Treat paths as workspace-relative and reject traversal such as `../`.
-2. Verify source existence and destination collisions before applying.
-3. Keep operations auditable in an activity log.
-4. Apply the operation to the client workspace only; the API returns intent and never mutates the browser filesystem.
-5. Keep credentials server-side and enforce authentication/rate limits before exposing this route publicly.
-
-## Example fetch
+Check available models:
 
 ```js
-const response = await fetch('https://your-app.example.com/api/chat', {
-  method: 'POST',
-  headers: { 'content-type': 'application/json' },
-  body: JSON.stringify({
-    autoReplace: false,
-    currentFile: { path: 'src/App.tsx', content },
-    fileStructure: ['src/App.tsx', 'src/styles.css'],
-    files: [{ path: 'src/App.tsx', content }],
-    messages: [{ role: 'user', content: 'Create src/utils.ts and move styles.css into src/ui/' }]
+const response = await fetch('https://your-domain.example/api/chat')
+const { provider, models } = await response.json()
+console.log(provider, models)
+```
+
+Open CORS is intended for personal frontends. Add authentication, origin restrictions, rate limiting, and server-side authorization before exposing a real repository to untrusted users.
+
+## 3. Sending a chat request
+
+Always send the current file and its complete content. Send the file tree as paths only by default. Do not send every file's contents: the AI can request another file and your frontend can ask the user for permission.
+
+```js
+async function askLevity({ prompt, currentFile, fileTree, model }) {
+  const response = await fetch('https://your-domain.example/api/chat', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model, // optional; the API discovers one when omitted
+      autoReplace: false,
+      currentFile: {
+        path: currentFile.path,
+        content: currentFile.content,
+      },
+      fileStructure: fileTree, // string[] of workspace-relative paths
+      files: [
+        // Only files already granted to the AI belong here.
+        { path: currentFile.path, content: currentFile.content },
+      ],
+      messages: [{ role: 'user', content: prompt }],
+    }),
   })
+
+  if (!response.ok) throw new Error(await response.text())
+  return response.json()
+}
+
+const result = await askLevity({
+  prompt: 'Rename the heading to Yodel Leviathan',
+  currentFile: { path: 'src/App.tsx', content: appSource },
+  fileTree: ['src/App.tsx', 'src/styles.css', 'src/lib/api.js'],
 })
-const data = await response.json()
-for (const operation of data.fileOperations ?? []) {
-  // Show approval UI, then apply operation to your own file model.
-  console.log(operation)
+```
+
+`currentFile` may also be sent as a path string, but the object form is recommended because it makes the current content explicit.
+
+## 4. Response shape
+
+A successful response looks like this:
+
+```js
+{
+  model: 'provider/model',
+  message: { role: 'assistant', content: 'I found the heading...' },
+  statuses: [
+    'thinking',
+    'reading current file and file structure',
+    'preparing edit'
+  ],
+  structuredEdits: [],
+  fileOperations: [],
+  accessRequests: [],
+  rounds: 2
 }
 ```
 
-This documentation lives at `docs/api-tool-calling.md`.
+`statuses` is ordered from oldest to newest. For a completed request, show the final status as `ready` in your UI. During a request, show the latest status rather than an animated generic "thinking" label:
 
-## Security note
+```js
+function statusLabel(result, isRunning) {
+  if (!isRunning) return 'ready'
+  const statuses = result?.statuses ?? []
+  return statuses.at(-1) ?? 'thinking'
+}
 
-Open CORS is intentionally configured for personal frontend use. It is not authentication. Add authentication, origin restrictions, rate limiting, and server-side path validation before using this route for untrusted users or real repositories.
+const response = await askLevity(request)
+statusElement.textContent = statusLabel(response, false)
+```
 
-The API also exposes bounded network fetch and JavaScript evaluation through its tools. JavaScript receives the server-provided `fetch` function for network access, but has no filesystem, process, imports, or dynamic code-generation access.
+If you display progress while the HTTP request is pending, use `Sending request…`; replace it with `result.statuses.at(-1)` as soon as the response arrives. The API returns statuses after its tool loop completes, not as an SSE stream.
+
+## 5. File read requests and permission flow
+
+The AI can see the current file and path-only tree by default. It must not receive unrelated file content until your frontend grants it. When it needs another file, `accessRequests` contains an item like:
+
+```js
+{
+  type: 'file_access_request',
+  action: 'read',
+  file: 'src/styles.css',
+  requiresFrontendGrant: true
+}
+```
+
+Show a permission prompt, then resubmit the conversation with that file in `files`. A browser client should read from its own editor model:
+
+```js
+async function continueAfterReadGrant({ request, previousMessages, workspace }) {
+  const requestedPath = request.file
+  const file = workspace.get(requestedPath)
+  if (!file) throw new Error(`Unknown workspace file: ${requestedPath}`)
+
+  return fetch('https://your-domain.example/api/chat', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      currentFile: workspace.currentFile(),
+      fileStructure: workspace.paths(),
+      files: [
+        { path: workspace.currentFile().path, content: workspace.currentFile().content },
+        { path: file.path, content: file.content },
+      ],
+      messages: previousMessages,
+    }),
+  }).then((r) => r.json())
+}
+
+const requested = result.accessRequests?.[0]
+if (requested) {
+  const approved = window.confirm(`Allow Levity AI to read ${requested.file}?`)
+  if (approved) result = await continueAfterReadGrant({
+    request: requested,
+    previousMessages: messages,
+    workspace,
+  })
+}
+```
+
+Keep the assistant message and prior user messages when continuing. Do not put a file into `files` merely because it appears in `fileStructure`.
+
+## 6. Find/replace proposals
+
+A find/replace tool result is returned in `structuredEdits`:
+
+```js
+{
+  type: 'find_replace',
+  file: 'src/App.tsx',
+  find: 'Hello from Levity',
+  replace: 'Yodel Leviathan',
+  expectedMatches: 1,
+  before: '...',
+  after: '...',
+  requiresApproval: true,
+  autoReplaceEligible: true
+}
+```
+
+Apply only an exact match and verify the expected count immediately before changing the file:
+
+```js
+function applyFindReplace(workspace, edit) {
+  const file = workspace.get(edit.file)
+  if (!file) throw new Error(`File is missing: ${edit.file}`)
+
+  const matches = file.content.split(edit.find).length - 1
+  if (matches !== edit.expectedMatches) {
+    throw new Error(`Expected ${edit.expectedMatches} matches, found ${matches}`)
+  }
+
+  workspace.update(edit.file, file.content.replace(edit.find, edit.replace))
+}
+
+for (const edit of result.structuredEdits ?? []) {
+  if (edit.type !== 'find_replace') continue
+  const approved = edit.autoReplaceEligible && autoReplaceEnabled
+    ? true
+    : window.confirm(`Apply replacement in ${edit.file}?`)
+  if (approved) applyFindReplace(workspace, edit)
+}
+```
+
+The API may also include compatibility XML in assistant text for text-only clients:
+
+```xml
+<find file="src/App.tsx"><![CDATA[Hello from Levity]]></find>
+<replace file="src/App.tsx"><![CDATA[Yodel Leviathan]]></replace>
+```
+
+Prefer `structuredEdits`. Only parse XML when `structuredEdits` is unavailable, and require matching `file` values plus an exact match count.
+
+## 7. Auto find/replace mode
+
+Enable automatic application by sending `autoReplace: true`:
+
+```js
+const result = await askLevity({
+  prompt: 'Update the heading',
+  currentFile,
+  fileTree,
+  autoReplace: true,
+})
+```
+
+The API marks ordinary exact find/replace edits with `autoReplaceEligible: true`. Your frontend still performs the final exact-match validation. Never auto-apply a general diff or a destructive file operation. A safe dispatcher is:
+
+```js
+function applyResult(result, workspace, { autoReplace }) {
+  for (const edit of result.structuredEdits ?? []) {
+    if (edit.type !== 'find_replace') continue
+    if (!autoReplace || !edit.autoReplaceEligible) continue
+    applyFindReplace(workspace, edit)
+  }
+}
+```
+
+For a production product, make auto mode an explicit user setting and show an activity log of every applied edit.
+
+## 8. File operations
+
+All file operations are returned as approval-required proposals. The API never changes your frontend workspace. Each item has `type: 'file_operation'`, an `operation`, and workspace-relative paths.
+
+```js
+{
+  type: 'file_operation',
+  operation: 'create',
+  path: 'src/utils/format.js',
+  content: 'export function format() {}',
+  requiresApproval: true,
+  autoReplaceEligible: false
+}
+```
+
+Supported operations:
+
+| Operation | Fields | Meaning |
+|---|---|---|
+| `create` | `path`, `content` | Create a new file. |
+| `clear` | `path` | Preserve the file and replace content with `''`. |
+| `delete` | `path` | Delete a file. |
+| `create_folder` | `path` | Create a folder entry. |
+| `move` | `path`, `destination` | Move or rename one file. |
+| `move_folder` | `path`, `destination` | Move every descendant path. |
+| `duplicate` | `path`, `destination` | Copy a file and preserve the source. |
+
+Apply them only after confirmation and validate paths/collisions:
+
+```js
+function validatePath(path) {
+  if (!path || path.startsWith('/') || path.split('/').includes('..')) {
+    throw new Error(`Unsafe workspace path: ${path}`)
+  }
+}
+
+function applyOperation(workspace, operation) {
+  validatePath(operation.path)
+  if (operation.destination) validatePath(operation.destination)
+
+  switch (operation.operation) {
+    case 'create':
+      if (workspace.has(operation.path)) throw new Error('Destination already exists')
+      workspace.create(operation.path, operation.content ?? '')
+      break
+    case 'clear':
+      workspace.update(operation.path, '')
+      break
+    case 'delete':
+      workspace.delete(operation.path)
+      break
+    case 'create_folder':
+      workspace.createFolder(operation.path)
+      break
+    case 'move':
+      workspace.move(operation.path, operation.destination)
+      break
+    case 'move_folder':
+      workspace.moveFolder(operation.path, operation.destination)
+      break
+    case 'duplicate':
+      if (workspace.has(operation.destination)) throw new Error('Destination already exists')
+      workspace.duplicate(operation.path, operation.destination)
+      break
+    default:
+      throw new Error(`Unsupported operation: ${operation.operation}`)
+  }
+}
+
+for (const operation of result.fileOperations ?? []) {
+  const approved = window.confirm(`Allow ${operation.operation} ${operation.path}?`)
+  if (approved) applyOperation(workspace, operation)
+}
+```
+
+Do not treat `autoReplace: true` as permission to auto-apply these operations. They are destructive or structural and remain approval-required. Keep undo support and an audit log.
+
+## 9. Complete integration loop
+
+This is a compact controller showing the recommended order: send the current file, display statuses, grant reads, review edits, and apply approved operations.
+
+```js
+async function runLevity(prompt, workspace, options = {}) {
+  const request = {
+    autoReplace: Boolean(options.autoReplace),
+    currentFile: workspace.currentFile(),
+    fileStructure: workspace.paths(),
+    files: workspace.grantedFiles(),
+    messages: [{ role: 'user', content: prompt }],
+  }
+
+  setStatus('Sending request…')
+  let result = await fetch('https://your-domain.example/api/chat', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(request),
+  }).then(async (response) => {
+    if (!response.ok) throw new Error(await response.text())
+    return response.json()
+  })
+
+  setStatus(result.statuses?.at(-1) ?? 'ready')
+
+  for (const readRequest of result.accessRequests ?? []) {
+    if (!await askPermission(`Read ${readRequest.file}?`)) continue
+    workspace.grant(readRequest.file)
+    // Re-run with the same conversation and newly granted file content.
+    result = await runLevity(prompt, workspace, options)
+  }
+
+  applyResult(result, workspace, options)
+  for (const operation of result.fileOperations ?? []) {
+    if (await askPermission(`Apply ${operation.operation} to ${operation.path}?`)) {
+      applyOperation(workspace, operation)
+    }
+  }
+
+  setStatus('ready')
+  return result
+}
+```
+
+In a real implementation, preserve the conversation messages and add a loop guard when continuing after a read request; the example focuses on the event flow.
+
+## 10. Security requirements
+
+- Treat every path as workspace-relative. Reject absolute paths and `..` traversal.
+- Do not expose upstream provider credentials in browser code.
+- Do not auto-apply delete, clear, move, move-folder, duplicate, create, or folder operations.
+- Check source existence and destination collisions before applying.
+- Keep an undo stack and an audit log.
+- Add authentication and rate limiting before using the open-CORS endpoint with real repositories.
+- The API's JavaScript tool has bounded network access through its provided `fetch`; it does not have filesystem or process access.
+
+The browser-facing implementation in this project is `app/page.tsx`. The server contract is `app/api/chat/route.ts`. This page is the canonical, untruncated integration reference: **`/docs`**.
