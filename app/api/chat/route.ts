@@ -14,7 +14,7 @@ const toolDefinitions = [
   { type: 'function', function: { name: 'apply_patch', description: 'Propose a reviewed patch. The frontend must ask the user before applying the returned diff.', parameters: { type: 'object', properties: { file: { type: 'string' }, content: { type: 'string' }, reason: { type: 'string' } }, required: ['file', 'content', 'reason'] } } },
   { type: 'function', function: { name: 'fetch_url', description: 'Fetch a URL and return status and bounded text.', parameters: { type: 'object', properties: { url: { type: 'string' }, method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'DELETE'] }, body: { type: 'string' } }, required: ['url'] } } },
   { type: 'function', function: { name: 'multi_fetch', description: 'Fetch several URLs in parallel.', parameters: { type: 'object', properties: { requests: { type: 'array', items: { type: 'object', properties: { url: { type: 'string' }, method: { type: 'string' } }, required: ['url'] } } }, required: ['requests'] } } },
-  { type: 'function', function: { name: 'run_javascript', description: 'Run a small pure JavaScript expression for parsing, transformation, or assertions. For network endpoint tests use fetch_url or multi_fetch; process and filesystem access are intentionally unavailable.', parameters: { type: 'object', properties: { code: { type: 'string' } }, required: ['code'] } } },
+  { type: 'function', function: { name: 'run_javascript', description: 'Run a bounded JavaScript expression or async expression. Network access is available through the provided fetch function, so use await fetch(url) for endpoint tests, response parsing, and assertions. Process, filesystem, imports, and dynamic code generation remain unavailable.', parameters: { type: 'object', properties: { code: { type: 'string' } }, required: ['code'] } } },
   { type: 'function', function: { name: 'mcp_tools', description: 'List tools available from the configured Levity MCP endpoint.', parameters: { type: 'object', properties: {} } } },
   { type: 'function', function: { name: 'mcp_call', description: 'Call a tool on the configured Levity MCP endpoint.', parameters: { type: 'object', properties: { name: { type: 'string' }, arguments: { type: 'object' } }, required: ['name'] } } },
 ]
@@ -49,7 +49,16 @@ async function executeTool(name: string, args: Record<string, unknown>, files: W
     try { const response = await fetch(String(args.url), { method: String(args.method || 'GET'), body: args.body ? String(args.body) : undefined, signal: AbortSignal.timeout(10000) }); return { status: response.status, url: response.url, body: bounded(await response.text()) } } catch (error) { return { error: error instanceof Error ? error.message : 'Fetch failed' } }
   }
   if (name === 'multi_fetch') { const requests = Array.isArray(args.requests) ? args.requests : []; return { results: await Promise.all(requests.slice(0, 8).map((request) => executeTool('fetch_url', request as Record<string, unknown>, files)) ) } }
-  if (name === 'run_javascript') { try { const code = String(args.code); if (/[;{}]|(fetch|process|globalThis|require|import|Deno|Bun|eval)/.test(code)) return { error: 'Only simple expressions are allowed.' }; return { result: Function(`"use strict"; return (${code})`)() } } catch (error) { return { error: error instanceof Error ? error.message : 'Execution failed' } } }
+  if (name === 'run_javascript') {
+    try {
+      const code = String(args.code)
+      if (/(process|globalThis|require|import|Deno|Bun|eval|Function|constructor|__dirname|__filename|child_process|fs\b)/.test(code)) return { error: 'Process and filesystem access are unavailable. Use the provided fetch function for network access.' }
+      const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor as new (...args: string[]) => (...values: unknown[]) => Promise<unknown>
+      const execute = new AsyncFunction('fetch', 'URL', `"use strict"; return (${code})`)
+      const result = await execute(fetch, URL)
+      return { result: typeof result === 'string' ? bounded(result) : result }
+    } catch (error) { return { error: error instanceof Error ? error.message : 'Execution failed' } }
+  }
   if (name === 'mcp_tools' || name === 'mcp_call') {
     const request = async (method: string, params: Record<string, unknown>) => {
       const response = await fetch(MCP_URL, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' }, body: JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method, params }), signal: AbortSignal.timeout(15000) })
