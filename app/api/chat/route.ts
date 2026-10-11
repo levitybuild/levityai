@@ -1,0 +1,71 @@
+import { NextRequest, NextResponse } from 'next/server'
+
+const HERMES_BASE = 'https://hermes.ai.unturf.com/v1'
+const MCP_URL = process.env.LEVITY_MCP_URL
+
+type WorkspaceFile = { path: string; content: string }
+type ChatMessage = { role: string; content?: string; tool_calls?: unknown[]; tool_call_id?: string; name?: string }
+
+const toolDefinitions = [
+  { type: 'function', function: { name: 'list_files', description: 'List files the user authorized for this workspace.', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'read_file', description: 'Read one authorized workspace file.', parameters: { type: 'object', properties: { file: { type: 'string' } }, required: ['file'] } } },
+  { type: 'function', function: { name: 'search_files', description: 'Search authorized files for an exact or regex string.', parameters: { type: 'object', properties: { query: { type: 'string' }, regex: { type: 'boolean' } }, required: ['query'] } } },
+  { type: 'function', function: { name: 'find_replace', description: 'Propose an exact replacement in an authorized file. Never applies it automatically.', parameters: { type: 'object', properties: { file: { type: 'string' }, find: { type: 'string' }, replace: { type: 'string' }, expectedMatches: { type: 'number' } }, required: ['file', 'find', 'replace', 'expectedMatches'] } } },
+  { type: 'function', function: { name: 'apply_patch', description: 'Propose a reviewed patch. The frontend must ask the user before applying the returned diff.', parameters: { type: 'object', properties: { file: { type: 'string' }, content: { type: 'string' }, reason: { type: 'string' } }, required: ['file', 'content', 'reason'] } } },
+  { type: 'function', function: { name: 'fetch_url', description: 'Fetch a URL and return status and bounded text.', parameters: { type: 'object', properties: { url: { type: 'string' }, method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'DELETE'] }, body: { type: 'string' } }, required: ['url'] } } },
+  { type: 'function', function: { name: 'multi_fetch', description: 'Fetch several URLs in parallel.', parameters: { type: 'object', properties: { requests: { type: 'array', items: { type: 'object', properties: { url: { type: 'string' }, method: { type: 'string' } }, required: ['url'] } } }, required: ['requests'] } } },
+  { type: 'function', function: { name: 'run_javascript', description: 'Run a small pure JavaScript expression in a restricted context. No filesystem, network, or process access.', parameters: { type: 'object', properties: { code: { type: 'string' } }, required: ['code'] } } },
+  { type: 'function', function: { name: 'mcp_tools', description: 'List tools available from the configured Levity MCP endpoint.', parameters: { type: 'object', properties: {} } } },
+  { type: 'function', function: { name: 'mcp_call', description: 'Call a tool on the configured Levity MCP endpoint.', parameters: { type: 'object', properties: { name: { type: 'string' }, arguments: { type: 'object' } }, required: ['name'] } } },
+]
+
+function safePath(file: string, files: WorkspaceFile[]) { return files.find((item) => item.path === file) }
+function bounded(value: string, max = 12000) { return value.length > max ? `${value.slice(0, max)}\n… truncated` : value }
+
+async function executeTool(name: string, args: Record<string, unknown>, files: WorkspaceFile[]): Promise<unknown> {
+  if (name === 'list_files') return { files: files.map(({ path, content }) => ({ path, bytes: content.length })) }
+  if (name === 'read_file') { const file = safePath(String(args.file), files); return file ? { file: file.path, content: bounded(file.content, 30000) } : { error: 'File is not authorized.' } }
+  if (name === 'search_files') {
+    const query = String(args.query); let matcher: RegExp
+    try { matcher = args.regex ? new RegExp(query, 'g') : new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g') } catch { return { error: 'Invalid regular expression.' } }
+    return { matches: files.flatMap((file) => { const lines = file.content.split('\n'); return lines.flatMap((line, index) => matcher.test(line) ? [{ file: file.path, line: index + 1, text: line.slice(0, 500) }] : []) }).slice(0, 100) }
+  }
+  if (name === 'find_replace') {
+    const file = safePath(String(args.file), files); if (!file) return { error: 'File is not authorized.' }
+    const find = String(args.find); const matches = file.content.split(find).length - 1
+    if (matches !== Number(args.expectedMatches)) return { error: `Expected ${args.expectedMatches} matches but found ${matches}. No change proposed.` }
+    return { type: 'diff', file: file.path, before: file.content, after: file.content.replace(find, String(args.replace)), matches, requiresApproval: true }
+  }
+  if (name === 'apply_patch') return { type: 'diff', file: String(args.file), content: String(args.content), reason: String(args.reason), requiresApproval: true }
+  if (name === 'fetch_url') {
+    try { const response = await fetch(String(args.url), { method: String(args.method || 'GET'), body: args.body ? String(args.body) : undefined, signal: AbortSignal.timeout(10000) }); return { status: response.status, url: response.url, body: bounded(await response.text()) } } catch (error) { return { error: error instanceof Error ? error.message : 'Fetch failed' } }
+  }
+  if (name === 'multi_fetch') { const requests = Array.isArray(args.requests) ? args.requests : []; return { results: await Promise.all(requests.slice(0, 8).map((request) => executeTool('fetch_url', request as Record<string, unknown>, files)) ) } }
+  if (name === 'run_javascript') { try { const code = String(args.code); if (/[;{}]|(fetch|process|globalThis|require|import|Deno|Bun|eval)/.test(code)) return { error: 'Only simple expressions are allowed.' }; return { result: Function(`"use strict"; return (${code})`)() } } catch (error) { return { error: error instanceof Error ? error.message : 'Execution failed' } } }
+  if (name === 'mcp_tools' || name === 'mcp_call') { if (!MCP_URL) return { error: 'LEVITY_MCP_URL is not configured.' }; const response = await fetch(MCP_URL, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: Date.now(), method: name === 'mcp_tools' ? 'tools/list' : 'tools/call', params: name === 'mcp_tools' ? {} : { name: args.name, arguments: args.arguments || {} } }) }); return response.json() }
+  return { error: `Unknown tool: ${name}` }
+}
+
+export async function GET() { const [models, version] = await Promise.all([fetch(`${HERMES_BASE}/models`).then((r) => r.json()), fetch('https://hermes.ai.unturf.com/version').then((r) => r.json()).catch(() => null)]); return NextResponse.json({ provider: 'Hermes / Unturf', version, models }) }
+
+export async function POST(request: NextRequest) {
+  try {
+    const body = await request.json(); const files: WorkspaceFile[] = Array.isArray(body.files) ? body.files.filter((file: WorkspaceFile) => file && typeof file.path === 'string' && typeof file.content === 'string').slice(0, 200) : []
+    const model = body.model || (await fetch(`${HERMES_BASE}/models`).then((r) => r.json())).data?.[0]?.id
+    if (!model) return NextResponse.json({ error: 'Hermes did not return a model.' }, { status: 503 })
+    const messages: ChatMessage[] = [{ role: 'system', content: `You are Levity AI, a focused coding agent. Use built-in tools when needed. Workspace access is limited to the authorized files provided. Edits are proposals and require user approval. Be concise. Current model: ${model}.` }, ...(Array.isArray(body.messages) ? body.messages : [])]
+    for (let round = 0; round < 8; round++) {
+      const completion = await fetch(`${HERMES_BASE}/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(30000), body: JSON.stringify({ model, messages, tools: toolDefinitions, tool_choice: 'auto', temperature: 0.2, max_tokens: Math.min(Number(body.maxTokens) || 8192, 32768), stream: false }) })
+      if (!completion.ok) return NextResponse.json({ error: `Hermes error ${completion.status}`, detail: bounded(await completion.text(), 4000) }, { status: 502 })
+      const data = await completion.json(); const assistant = data.choices?.[0]?.message; if (!assistant) return NextResponse.json({ error: 'Hermes returned no message.' }, { status: 502 })
+      messages.push(assistant)
+      if (!assistant.tool_calls?.length) return NextResponse.json({ model, message: assistant, rounds: round + 1 })
+      const results = await Promise.all(assistant.tool_calls.map(async (call: { id: string; function: { name: string; arguments: string } }) => { let args: Record<string, unknown>; try { args = JSON.parse(call.function.arguments || '{}') } catch { args = {} }; return { role: 'tool', tool_call_id: call.id, name: call.function.name, content: JSON.stringify(await executeTool(call.function.name, args, files)) } }))
+      messages.push(...results)
+    }
+    return NextResponse.json({ error: 'Tool loop limit reached.' }, { status: 508 })
+  } catch (error) { return NextResponse.json({ error: error instanceof Error ? error.message : 'Request failed' }, { status: 500 }) }
+}
+
+export const maxDuration = 60
+export const dynamic = 'force-dynamic'
