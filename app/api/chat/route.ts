@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 
 const HERMES_BASE = 'https://hermes.ai.unturf.com/v1'
+const DEFAULT_MODEL = 'turboderp/Qwen3.8-27B-exl3'
 const MCP_URL = process.env.LEVITY_MCP_URL || 'https://api.levity.click/mcp'
 
 type WorkspaceFile = { path: string; content: string }
@@ -160,8 +161,7 @@ export async function POST(request: NextRequest) {
     const images = Array.isArray(body.images) ? body.images.map((image: ImageInput) => imagePart(image)).filter(Boolean).slice(0, 8) : []
     statuses.push('reading current file and file structure')
     const requestedModel = typeof body.model === 'string' && body.model !== 'loading model…' && body.model !== 'Hermes model unavailable' && body.model !== 'offline' ? body.model : null
-    const model = requestedModel || await discoverModel()
-    if (!model) return json({ error: 'Hermes did not return an available model.', statuses }, { status: 503 })
+    const model = requestedModel || DEFAULT_MODEL
     const userMessages = Array.isArray(body.messages) ? body.messages : []
     const lastUserIndex = userMessages.map((message: ChatMessage) => message?.role).lastIndexOf('user')
     if (images.length > 0 && lastUserIndex >= 0) {
@@ -193,7 +193,9 @@ export async function POST(request: NextRequest) {
       messages.push(...results)
     }
     return NextResponse.json({ error: 'Tool loop limit reached.' }, { status: 508 })
-  } catch (error) { return NextResponse.json({ error: error instanceof Error ? error.message : 'Request failed' }, { status: 500 }) }
+  } catch (error) {
+    return json({ error: error instanceof Error ? error.message : 'Request failed', statuses }, { status: 500 })
+  }
 }
 
 export const maxDuration = 60
