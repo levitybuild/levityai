@@ -39,11 +39,14 @@ export default function Page() {
   function applyEdit(edit: EditProposal) { setFiles((current) => current.map((file) => file.path === edit.file ? { ...file, content: edit.after } : file)); if (edit.file === activePath) setDraft(edit.after); setProposal(null); setStatus('edit applied') }
   async function sendPrompt() {
     if (!prompt.trim() || thinking) return
-    const text = prompt.trim(); setPrompt(''); setStatus('thinking'); setMessages((current) => [...current, { role: 'user', content: text }]); setThinking(true)
+    const text = prompt.trim(); const lowerText = text.toLowerCase()
+    const initialStatus = lowerText.includes('javascript') || lowerText.includes('js expression') ? 'running JavaScript' : lowerText.includes('fetch') || lowerText.includes('url') || lowerText.includes('endpoint') ? 'fetching endpoint' : lowerText.includes('read') || lowerText.includes('file') ? 'reading current file' : 'working'
+    setPrompt(''); setStatus(initialStatus); setMessages((current) => [...current, { role: 'user', content: text }]); setThinking(true)
     try {
       const response = await fetch('/api/chat', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model, autoReplace, files: files.filter((file) => file.path === activePath), currentFile: { path: activePath, content: draft }, fileStructure: files.map((file) => file.path), messages: [{ role: 'user', content: text }] }) })
       const data: ApiResult = await response.json(); const edit = data.structuredEdits?.at(-1); const request = data.accessRequests?.at(-1)
-      setStatus(data.statuses?.at(-1) || 'ready'); if (request) setReadRequest(request)
+      const responseStatus = data.statuses?.filter((value) => value !== 'thinking').at(-1)
+      setStatus(responseStatus || (data.error ? 'request failed' : 'ready')); if (request) setReadRequest(request)
       if (edit) { if (autoReplace && edit.autoReplaceEligible) applyEdit(edit); else setProposal(edit) }
       setMessages((current) => [...current, { role: 'assistant', content: data.message?.content || data.error || (edit ? `I found a safe replacement in ${edit.file}.` : 'No response received.'), tool: data.message?.tool_calls?.length ? `${data.message.tool_calls.length} tool call${data.message.tool_calls.length === 1 ? '' : 's'}` : undefined }])
     } catch { setStatus('offline'); setMessages((current) => [...current, { role: 'assistant', content: 'Network unavailable. The editor is still available offline.' }]) } finally { setThinking(false) }
