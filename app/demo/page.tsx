@@ -1,6 +1,6 @@
 'use client'
 
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { Bot, Check, ChevronRight, Code2, FilePlus2, Folder, FolderPlus, Loader2, Play, Plus, RefreshCw, Send, Sparkles, Trash2, X } from 'lucide-react'
 
 const API_BASE = 'https://levityai-three.vercel.app'
@@ -34,6 +34,21 @@ export default function DemoPage() {
   const [model, setModel] = useState('Discovering model…')
   const [showSettings, setShowSettings] = useState(false)
   const [showPreview, setShowPreview] = useState(false)
+  const [imageInput, setImageInput] = useState('')
+  const [imageData, setImageData] = useState<string | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    fetch(`${API_BASE}/api/chat`, { headers: { accept: 'application/json' } })
+      .then(async (response) => {
+        const data = await response.json() as { models?: { data?: Array<{ id?: string }> } | Array<{ id?: string }> }
+        const models = Array.isArray(data.models) ? data.models : data.models?.data
+        const discovered = models?.find((item) => item.id)?.id
+        if (!cancelled) setModel(discovered ?? 'Hermes model unavailable')
+      })
+      .catch(() => { if (!cancelled) setModel('Hermes model unavailable') })
+    return () => { cancelled = true }
+  }, [])
 
   const active = useMemo(() => files.find((file) => file.path === activePath) ?? files[0], [files, activePath])
   const dirty = draft !== active.content
@@ -63,7 +78,7 @@ export default function DemoPage() {
     if (!prompt.trim() || busy) return
     const request = prompt.trim(); setPrompt(''); setBusy(true); setStatus('Sending prompt'); setActivities([{ label: 'Sending prompt', detail: 'Preparing current file and tree', tone: 'active' }]); setMessages((current) => [...current, { role: 'user', content: request }])
     try {
-      const response = await fetch(`${API_BASE}/api/chat`, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' }, body: JSON.stringify({ prompt: request, systemPrompt, autoReplace: true, fileReplacement: true, currentFile: { path: activePath, content: draft }, files: [{ path: activePath, content: draft }], fileStructure: files.map((file) => file.path), messages: [{ role: 'user', content: request }] }) })
+      const response = await fetch(`${API_BASE}/api/chat`, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' }, body: JSON.stringify({ prompt: request, systemPrompt, autoReplace: true, fileReplacement: true, currentFile: { path: activePath, content: draft }, files: files.map((file) => file.path === activePath ? { ...file, content: draft } : file), fileStructure: files.map((file) => file.path), images: imageData || imageInput ? [{ url: imageInput || undefined, data: imageData || undefined, mediaType: imageData?.match(/^data:([^;]+)/)?.[1] }] : [], messages: [{ role: 'user', content: request }] }) })
       const data: ApiPayload = await response.json()
       if (!response.ok) throw new Error(data.error ?? 'Request failed')
       const nextActivities: Activity[] = (data.statuses ?? ['AI response received']).map((label, index, all) => ({ label, detail: index === all.length - 1 ? 'Completed' : 'API event', tone: index === all.length - 1 ? 'done' : 'muted' }))
@@ -78,7 +93,7 @@ export default function DemoPage() {
     <header className="demo-topbar"><div className="demo-brand"><span className="demo-mark"><Sparkles size={15} /></span><strong>Levity</strong><span className="demo-slash">/</span><span>Static editor</span><span className="demo-live"><i /> API connected</span></div><div className="demo-header-actions"><span className="demo-endpoint">{API_BASE}</span><button className="demo-icon-button" onClick={() => setShowSettings((value) => !value)} aria-label="Open settings">Settings</button></div></header>
     <div className="demo-layout">
       <aside className="demo-files"><div className="demo-section-label"><span>FILES</span><button onClick={() => setFiles((current) => [...current, { path: `new-${current.length}.html`, content: '' }])} aria-label="Create file"><Plus size={15} /></button></div><div className="demo-project"><Folder size={14} /> demo-project</div>{files.map((file) => <button key={file.path} className={`demo-file ${file.path === activePath ? 'selected' : ''}`} onClick={() => selectFile(file.path)}><Code2 size={14} /><span>{file.path}</span></button>)}<div className="demo-file-hint">AI write actions are applied automatically.</div></aside>
-      <section className="demo-workspace"><div className="demo-toolbar"><div><span className="demo-file-title">{activePath}</span>{dirty && <span className="demo-unsaved">unsaved</span>}</div><div className="demo-toolbar-actions"><button onClick={saveDraft} disabled={!dirty}>{dirty ? 'Save' : 'Saved'}</button><button onClick={() => setShowPreview((value) => !value)}><Play size={13} /> {showPreview ? 'Editor' : 'Preview'}</button></div></div>{showPreview ? <div className="demo-preview"><div dangerouslySetInnerHTML={{ __html: activePath.endsWith('.html') ? draft : '<p>Preview available for HTML files.</p>' }} /></div> : <div className="demo-code"><div className="demo-line-numbers">{lines.map((_, index) => <span key={index}>{index + 1}</span>)}</div><textarea value={draft} onChange={(event) => setDraft(event.target.value)} spellCheck={false} aria-label="Static file editor" /></div>}<div className="demo-commandbar"><span className={busy ? 'demo-spinner' : ''}>{busy ? <Loader2 size={14} /> : <Check size={14} />}</span><input value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.nativeEvent.isComposing && event.keyCode !== 229) send() }} placeholder="Ask AI to edit or manage files…" /><button onClick={send} disabled={busy || !prompt.trim()} aria-label="Send prompt"><Send size={15} /></button></div></section>
+      <section className="demo-workspace"><div className="demo-toolbar"><div><span className="demo-file-title">{activePath}</span>{dirty && <span className="demo-unsaved">unsaved</span>}</div><div className="demo-toolbar-actions"><button onClick={saveDraft} disabled={!dirty}>{dirty ? 'Save' : 'Saved'}</button><button onClick={() => setShowPreview((value) => !value)}><Play size={13} /> {showPreview ? 'Editor' : 'Preview'}</button></div></div>{showPreview ? <div className="demo-preview"><div dangerouslySetInnerHTML={{ __html: activePath.endsWith('.html') ? draft : '<p>Preview available for HTML files.</p>' }} /></div> : <div className="demo-code"><div className="demo-line-numbers">{lines.map((_, index) => <span key={index}>{index + 1}</span>)}</div><textarea value={draft} onChange={(event) => setDraft(event.target.value)} spellCheck={false} aria-label="Static file editor" /></div>}<div className="demo-image-controls"><label>Image URL <input value={imageInput} onChange={(event) => setImageInput(event.target.value)} placeholder="https://…" /></label><label className="demo-upload">Upload image<input type="file" accept="image/*" onChange={(event) => { const file = event.target.files?.[0]; if (!file) return; const reader = new FileReader(); reader.onload = () => setImageData(typeof reader.result === 'string' ? reader.result : null); reader.readAsDataURL(file) }} /></label>{(imageInput || imageData) && <button onClick={() => { setImageInput(''); setImageData(null) }}>Clear image</button>}</div><div className="demo-commandbar"><span className={busy ? 'demo-spinner' : ''}>{busy ? <Loader2 size={14} /> : <Check size={14} />}</span><input value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.nativeEvent.isComposing && event.keyCode !== 229) send() }} placeholder="Ask AI to edit or manage files…" /><button onClick={send} disabled={busy || !prompt.trim()} aria-label="Send prompt"><Send size={15} /></button></div></section>
       <aside className="demo-ai"><div className="demo-ai-head"><div><div className="demo-ai-title"><Bot size={17} /> AI activity</div><div className="demo-status"><i className={busy ? 'active' : ''} /> {status}</div><div className="demo-model">Model: {model}</div></div><button className="demo-icon-button" onClick={() => setShowSettings((value) => !value)} aria-label="Toggle system prompt">{showSettings ? <X size={15} /> : 'Prompt'}</button></div>{showSettings && <div className="demo-settings"><label htmlFor="system-prompt">System prompt</label><textarea id="system-prompt" value={systemPrompt} onChange={(event) => setSystemPrompt(event.target.value)} /><small>Sent with every request. Auto file replacement is always on.</small></div>}<div className="demo-activity">{activities.map((item, index) => <div className={`demo-activity-row ${item.tone ?? ''}`} key={`${item.label}-${index}`}><span className="demo-activity-icon">{item.tone === 'active' ? <Loader2 className="demo-spinner" size={14} /> : <Check size={14} />}</span><div><strong>{item.label}</strong><span>{item.detail}</span></div></div>)}</div><div className="demo-chat">{messages.map((message, index) => <div className={`demo-chat-message ${message.role}`} key={index}><span>{message.role === 'assistant' ? <Sparkles size={12} /> : 'You'}</span><p>{message.content}</p></div>)}</div><div className="demo-api-note"><strong>Automatic mode</strong><span>Reads the active file by default, then applies edits, creates, clears, deletes, moves, duplicates, and folder actions from the API response.</span></div></aside>
     </div>
   </main>
