@@ -193,7 +193,9 @@ export async function POST(request: NextRequest) {
       messages.push(...results)
     }
     return NextResponse.json({ error: 'Tool loop limit reached.' }, { status: 508 })
-  } catch (error) { return NextResponse.json({ error: error instanceof Error ? error.message : 'Request failed' }, { status: 500 }) }
+  } catch (error) {
+    return json({ error: error instanceof Error ? error.message : 'Request failed', statuses }, { status: 500 })
+  }
 }
 
 export const maxDuration = 60
