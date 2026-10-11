@@ -10,7 +10,7 @@ const toolDefinitions = [
   { type: 'function', function: { name: 'list_files', description: 'List files the user authorized for this workspace.', parameters: { type: 'object', properties: {} } } },
   { type: 'function', function: { name: 'read_file', description: 'Read one authorized workspace file.', parameters: { type: 'object', properties: { file: { type: 'string' } }, required: ['file'] } } },
   { type: 'function', function: { name: 'search_files', description: 'Search authorized files for an exact or regex string.', parameters: { type: 'object', properties: { query: { type: 'string' }, regex: { type: 'boolean' } }, required: ['query'] } } },
-  { type: 'function', function: { name: 'find_replace', description: 'Propose an exact replacement in an authorized file. Never applies it automatically.', parameters: { type: 'object', properties: { file: { type: 'string' }, find: { type: 'string' }, replace: { type: 'string' }, expectedMatches: { type: 'number' } }, required: ['file', 'find', 'replace', 'expectedMatches'] } } },
+  { type: 'function', function: { name: 'find_replace', description: 'Return a structured exact replacement proposal. The frontend may apply it automatically only when autoReplace is enabled; otherwise it must ask for approval.', parameters: { type: 'object', properties: { file: { type: 'string' }, find: { type: 'string' }, replace: { type: 'string' }, expectedMatches: { type: 'number' } }, required: ['file', 'find', 'replace', 'expectedMatches'] } } },
   { type: 'function', function: { name: 'apply_patch', description: 'Propose a reviewed patch. The frontend must ask the user before applying the returned diff.', parameters: { type: 'object', properties: { file: { type: 'string' }, content: { type: 'string' }, reason: { type: 'string' } }, required: ['file', 'content', 'reason'] } } },
   { type: 'function', function: { name: 'fetch_url', description: 'Fetch a URL and return status and bounded text.', parameters: { type: 'object', properties: { url: { type: 'string' }, method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'DELETE'] }, body: { type: 'string' } }, required: ['url'] } } },
   { type: 'function', function: { name: 'multi_fetch', description: 'Fetch several URLs in parallel.', parameters: { type: 'object', properties: { requests: { type: 'array', items: { type: 'object', properties: { url: { type: 'string' }, method: { type: 'string' } }, required: ['url'] } } }, required: ['requests'] } } },
@@ -42,7 +42,7 @@ async function executeTool(name: string, args: Record<string, unknown>, files: W
     const file = safePath(String(args.file), files); if (!file) return { error: 'File is not authorized.' }
     const find = String(args.find); const matches = file.content.split(find).length - 1
     if (matches !== Number(args.expectedMatches)) return { error: `Expected ${args.expectedMatches} matches but found ${matches}. No change proposed.` }
-    return { type: 'diff', file: file.path, before: file.content, after: file.content.replace(find, String(args.replace)), matches, requiresApproval: true }
+    return { type: 'find_replace', file: file.path, find, replace: String(args.replace), expectedMatches: matches, before: file.content, after: file.content.replace(find, String(args.replace)), requiresApproval: true, autoReplaceEligible: true }
   }
   if (name === 'apply_patch') return { type: 'diff', file: String(args.file), content: String(args.content), reason: String(args.reason), requiresApproval: true }
   if (name === 'fetch_url') {
@@ -91,10 +91,12 @@ export async function GET() {
 }
 
 export async function POST(request: NextRequest) {
-  const statuses: string[] = ['thinking']
+    const statuses: string[] = ['thinking']
+    const structuredEdits: unknown[] = []
+    const accessRequests: unknown[] = []
   try {
     const body = await request.json(); const files: WorkspaceFile[] = Array.isArray(body.files) ? body.files.filter((file: WorkspaceFile) => file && typeof file.path === 'string' && typeof file.content === 'string').slice(0, 200) : []
-    const currentFile = typeof body.currentFile === 'string' ? body.currentFile : ''
+    const currentFile = body.currentFile && typeof body.currentFile === 'object' && typeof body.currentFile.path === 'string' ? body.currentFile.path : typeof body.currentFile === 'string' ? body.currentFile : ''
     const fileStructure = Array.isArray(body.fileStructure) ? body.fileStructure.filter((value: unknown): value is string => typeof value === 'string').slice(0, 500) : files.map((file) => file.path)
     statuses.push('reading current file and file structure')
     const requestedModel = typeof body.model === 'string' && body.model !== 'loading model…' && body.model !== 'Hermes model unavailable' && body.model !== 'offline' ? body.model : null
@@ -113,9 +115,9 @@ export async function POST(request: NextRequest) {
       if (!completion || !completion.ok) return json({ error: `Hermes error ${completion?.status || 502}`, detail: bounded(await completion?.text() || 'Upstream request was throttled or unavailable.', 4000), statuses }, { status: 502 })
       const data = await completion.json(); const assistant = data.choices?.[0]?.message; if (!assistant) return NextResponse.json({ error: 'Hermes returned no message.' }, { status: 502 })
       messages.push(assistant)
-      if (!assistant.tool_calls?.length) return json({ model, message: assistant, rounds: round + 1, statuses })
+      if (!assistant.tool_calls?.length) return json({ model, message: assistant, rounds: round + 1, statuses, structuredEdits, accessRequests })
       assistant.tool_calls.forEach((call: { function: { name: string } }) => { const status = toolStatus[call.function.name]; if (status) statuses.push(status) })
-      const results = await Promise.all(assistant.tool_calls.map(async (call: { id: string; function: { name: string; arguments: string } }) => { let args: Record<string, unknown>; try { args = JSON.parse(call.function.arguments || '{}') } catch { args = {} }; return { role: 'tool', tool_call_id: call.id, name: call.function.name, content: JSON.stringify(await executeTool(call.function.name, args, files)) } }))
+      const results = await Promise.all(assistant.tool_calls.map(async (call: { id: string; function: { name: string; arguments: string } }) => { let args: Record<string, unknown>; try { args = JSON.parse(call.function.arguments || '{}') } catch { args = {} }; const result = await executeTool(call.function.name, args, files); if (result && typeof result === 'object') { if ((result as { type?: string }).type === 'find_replace' || (result as { type?: string }).type === 'diff') structuredEdits.push(result); if ((result as { type?: string }).type === 'file_access_request') accessRequests.push(result) }; return { role: 'tool', tool_call_id: call.id, name: call.function.name, content: JSON.stringify(result) } }))
       messages.push(...results)
     }
     return NextResponse.json({ error: 'Tool loop limit reached.' }, { status: 508 })

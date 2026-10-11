@@ -1,40 +1,89 @@
-# Levity API tool calling
+# Levity AI editor protocol
 
-All model requests and tool execution live in `POST /api/chat`; the browser is only a permissioned workspace client and renderer.
+The live documentation for the editor is this file: `docs/api-tool-calling.md`.
 
-## Workspace payload
+## Workspace visibility defaults
 
-The frontend sends:
+The frontend sends the selected `currentFile` and `fileStructure` on every request. By default, the API receives only the selected file's content plus the tree of paths. Contents of other files are not sent until the model requests them with `read_file`. The frontend must show that request and explicitly grant the file by sending its content in a follow-up request.
 
-- `files`: authorized `{ path, content }` entries.
-- `currentFile`: the selected file `{ path, content }`.
-- `fileStructure`: paths visible to the agent.
-- `messages`: the conversation.
+```json
+{
+  "currentFile": { "path": "src/App.tsx", "content": "..." },
+  "fileStructure": ["src/App.tsx", "src/styles.css"],
+  "files": [{ "path": "src/App.tsx", "content": "..." }]
+}
+```
 
-The API cannot read files that are not in this payload. File tools return a `file_access_request` shape so a future client can explicitly grant access before exposing new content. Edit tools always return proposals and require user approval.
+## Structured find and replace
 
-## Built-in tools
+AI edit output is machine-readable in `structuredEdits`. The assistant may also describe the change in `message.content`, but the frontend should use the structured object for applying edits.
 
-`list_files`, `read_file`, `search_files`, `find_replace`, `apply_patch`, `fetch_url`, `multi_fetch`, `run_javascript`, `mcp_tools`, and `mcp_call`.
+```json
+{
+  "type": "find_replace",
+  "file": "src/App.tsx",
+  "find": "<h1>Hello from Levity</h1>",
+  "replace": "<h1>Yodel Leviathan</h1>",
+  "expectedMatches": 1,
+  "before": "...",
+  "after": "...",
+  "requiresApproval": true,
+  "autoReplaceEligible": true
+}
+```
 
-When the user says “check Levity”, the server checks `https://api.levity.click/mcp` (or `LEVITY_MCP_URL`) first, lists tools, and calls the relevant MCP tool. If MCP returns another URL, the agent can inspect it with `fetch_url` or `multi_fetch`. MCP credentials stay server-side.
+The API validates the exact match count before returning a proposal. Normal mode renders a review card and waits for Apply. Auto-replace mode may apply only `autoReplaceEligible` proposals and should still display the resulting status and file path.
 
-`fetch_url` is the network tool for endpoint testing and project creation APIs. `run_javascript` is deliberately limited to safe expressions; arbitrary process, filesystem, and unrestricted code execution are not exposed from a public API. Do not add those capabilities without authentication, isolation, resource limits, and an explicit security review.
+For transport-oriented consumers, the same intent can be represented as XML-like blocks in assistant text:
 
-## Status and CORS
+```xml
+<find file="src/App.tsx"><![CDATA[<h1>Hello from Levity</h1>]]></find>
+<replace file="src/App.tsx"><![CDATA[<h1>Yodel Leviathan</h1>]]></replace>
+```
 
-Responses include `statuses`, such as `thinking`, `reading current file and file structure`, `checking Levity MCP`, `fetching endpoint`, or `running JavaScript`. The frontend renders the latest status while a request is active. `OPTIONS` and API responses allow cross-origin requests with `Access-Control-Allow-Origin: *`; add authentication before exposing write-capable tools publicly.
+Clients should prefer `structuredEdits`; parse text blocks only as a compatibility fallback. Never apply a replacement without exact-match validation.
 
-## Request example
+## Read requests
+
+A file read returns:
+
+```json
+{
+  "type": "file_access_request",
+  "action": "read",
+  "file": "src/styles.css",
+  "requiresFrontendGrant": true
+}
+```
+
+The client presents a Grant access control. After approval, it resubmits the request with that file in `files`. The server remains bounded to the payload and never reads the browser filesystem itself.
+
+## Status events
+
+Every response includes `statuses`, ordered from oldest to newest. The UI should render the latest value while work is active: `thinking`, `reading current file and file structure`, `requesting file access`, `searching files`, `preparing edit`, `fetching endpoint`, `running JavaScript`, and `ready`. A client may use these values for a progress label, activity log, or accessibility live region.
+
+## Frontend integration checklist
+
+1. Send current file and path tree by default; omit unrelated contents.
+2. Render `accessRequests` as an explicit permission prompt.
+3. Render `structuredEdits` as a reviewable find/replace card.
+4. Apply only after approval, unless the user enabled auto-replace.
+5. Keep `before`, `after`, `file`, and status visible so the edit is auditable.
+6. Keep API credentials and MCP credentials server-side.
+
+The preview implementation is in `app/page.tsx`; the API contract is in `app/api/chat/route.ts`.
+
+## Example request
 
 ```json
 {
   "model": "provider/model",
+  "autoReplace": false,
   "currentFile": { "path": "src/App.tsx", "content": "..." },
   "fileStructure": ["src/App.tsx", "package.json"],
   "files": [{ "path": "src/App.tsx", "content": "..." }],
-  "messages": [{ "role": "user", "content": "Check Levity" }]
+  "messages": [{ "role": "user", "content": "Change the heading" }]
 }
 ```
 
-The API performs the model/tool loop server-side and returns `message`, `rounds`, and `statuses`.
+The response includes `message`, `rounds`, `statuses`, `structuredEdits`, and `accessRequests`.
