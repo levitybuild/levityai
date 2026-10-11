@@ -56,10 +56,10 @@ function estimateContext(messages: ChatMessage[]) {
 }
 function corsHeaders() { return { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET,POST,OPTIONS', 'access-control-allow-headers': 'content-type, authorization' } }
 function json(data: unknown, init?: ResponseInit) { return NextResponse.json(data, { ...init, headers: { ...corsHeaders(), ...(init?.headers || {}) } }) }
-function eventStream(data: unknown) {
-  const encoder = new TextEncoder()
-  const payload = JSON.stringify(data)
-  return new Response(`event: result\\ndata: ${payload}\\n\\nevent: done\\ndata: ${JSON.stringify({ ok: true })}\\n\\n`, { headers: { ...corsHeaders(), 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache, no-transform', connection: 'keep-alive' } })
+function eventStream(data: { statuses?: string[] }) {
+  const statuses = Array.isArray(data.statuses) ? data.statuses : []
+  const events = statuses.map((status) => `event: status\\ndata: ${JSON.stringify({ status })}\\n\\n`).join('')
+  return new Response(`${events}event: result\\ndata: ${JSON.stringify(data)}\\n\\nevent: done\\ndata: ${JSON.stringify({ ok: true })}\\n\\n`, { headers: { ...corsHeaders(), 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache, no-transform', connection: 'keep-alive' } })
 }
 
 const toolStatus: Record<string, string> = {
@@ -176,7 +176,7 @@ export async function POST(request: NextRequest) {
       const completionBody = JSON.stringify({ model, messages, tools: toolDefinitions, tool_choice: 'auto', temperature: 0.2, max_tokens: Math.min(Number(body.maxTokens) || 8192, 32768), stream: false })
       let completion: Response | null = null
       for (let attempt = 0; attempt < 3; attempt++) {
-        completion = await fetch(`${HERMES_BASE}/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(30000), body: completionBody })
+        completion = await fetch(`${HERMES_BASE}/chat/completions`, { method: 'POST', headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(120000), body: completionBody })
         if (completion.status !== 429 || attempt === 2) break
         const retryAfter = Number(completion.headers.get('retry-after'))
         await new Promise((resolve) => setTimeout(resolve, Number.isFinite(retryAfter) ? Math.min(retryAfter * 1000, 5000) : 1000 * (attempt + 1)))
@@ -194,7 +194,10 @@ export async function POST(request: NextRequest) {
     }
     return NextResponse.json({ error: 'Tool loop limit reached.' }, { status: 508 })
   } catch (error) {
-    return json({ error: error instanceof Error ? error.message : 'Request failed', statuses }, { status: 500 })
+    const message = error instanceof Error ? error.message : 'Request failed'
+    const timedOut = error instanceof DOMException && error.name === 'TimeoutError'
+    statuses.push(timedOut ? 'request timed out after 120 seconds' : 'request failed')
+    return json({ error: timedOut ? 'Hermes request timed out after 120 seconds.' : message, statuses }, { status: timedOut ? 504 : 500 })
   }
 }
 
