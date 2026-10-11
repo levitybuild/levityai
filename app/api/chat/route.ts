@@ -21,10 +21,18 @@ const toolDefinitions = [
 
 function safePath(file: string, files: WorkspaceFile[]) { return files.find((item) => item.path === file) }
 function bounded(value: string, max = 12000) { return value.length > max ? `${value.slice(0, max)}\n… truncated` : value }
+function corsHeaders() { return { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET,POST,OPTIONS', 'access-control-allow-headers': 'content-type, authorization' } }
+function json(data: unknown, init?: ResponseInit) { return NextResponse.json(data, { ...init, headers: { ...corsHeaders(), ...(init?.headers || {}) } }) }
+
+const toolStatus: Record<string, string> = {
+  list_files: 'reading file structure', read_file: 'requesting file access', search_files: 'searching files',
+  find_replace: 'preparing edit', apply_patch: 'preparing patch', fetch_url: 'fetching endpoint',
+  multi_fetch: 'fetching endpoints', run_javascript: 'running JavaScript', mcp_tools: 'checking Levity MCP', mcp_call: 'calling Levity MCP',
+}
 
 async function executeTool(name: string, args: Record<string, unknown>, files: WorkspaceFile[]): Promise<unknown> {
   if (name === 'list_files') return { files: files.map(({ path, content }) => ({ path, bytes: content.length })) }
-  if (name === 'read_file') { const file = safePath(String(args.file), files); return file ? { file: file.path, content: bounded(file.content, 30000) } : { error: 'File is not authorized.' } }
+  if (name === 'read_file') { const file = safePath(String(args.file), files); return file ? { type: 'file_access_request', action: 'read', file: file.path, requiresFrontendGrant: true, content: bounded(file.content, 30000) } : { type: 'file_access_request', action: 'read', file: String(args.file), requiresFrontendGrant: true, error: 'Frontend must grant this file before its contents are returned.' } }
   if (name === 'search_files') {
     const query = String(args.query); let matcher: RegExp
     try { matcher = args.regex ? new RegExp(query, 'g') : new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g') } catch { return { error: 'Invalid regular expression.' } }
@@ -70,6 +78,8 @@ async function discoverModel(): Promise<string | null> {
   return Array.isArray(models) && typeof models[0]?.id === 'string' ? models[0].id : null
 }
 
+export async function OPTIONS() { return new NextResponse(null, { status: 204, headers: corsHeaders() }) }
+
 export async function GET() {
   try {
     const modelsResult = await fetchJson(`${HERMES_BASE}/models`, undefined, 5000)
@@ -81,12 +91,16 @@ export async function GET() {
 }
 
 export async function POST(request: NextRequest) {
+  const statuses: string[] = ['thinking']
   try {
     const body = await request.json(); const files: WorkspaceFile[] = Array.isArray(body.files) ? body.files.filter((file: WorkspaceFile) => file && typeof file.path === 'string' && typeof file.content === 'string').slice(0, 200) : []
+    const currentFile = typeof body.currentFile === 'string' ? body.currentFile : ''
+    const fileStructure = Array.isArray(body.fileStructure) ? body.fileStructure.filter((value: unknown): value is string => typeof value === 'string').slice(0, 500) : files.map((file) => file.path)
+    statuses.push('reading current file and file structure')
     const requestedModel = typeof body.model === 'string' && body.model !== 'loading model…' && body.model !== 'Hermes model unavailable' && body.model !== 'offline' ? body.model : null
     const model = requestedModel || await discoverModel()
-    if (!model) return NextResponse.json({ error: 'Hermes did not return an available model.' }, { status: 503 })
-    const messages: ChatMessage[] = [{ role: 'system', content: `You are Levity AI, a focused coding agent. Use built-in tools when needed. Workspace access is limited to the authorized files provided. Edits are proposals and require user approval. Be concise. Current model: ${model}. IMPORTANT: when the user says check Levity, inspect Levity through MCP first using mcp_tools, then mcp_call as needed. The Levity MCP endpoint is already configured at ${MCP_URL}; do not tell the user to call Levity MCP or ask them to configure it. If MCP exposes a URL or endpoint, use fetch_url or multi_fetch to inspect it further. Use fetch_url for endpoint testing and network access; do not claim run_javascript can access the process or unrestricted network.` }, ...(Array.isArray(body.messages) ? body.messages : [])]
+    if (!model) return json({ error: 'Hermes did not return an available model.', statuses }, { status: 503 })
+    const messages: ChatMessage[] = [{ role: 'system', content: `You are Levity AI, a focused coding agent. All tool calls happen on the API, never in the frontend. Workspace access is limited to the files provided by the frontend. The current file is ${currentFile || 'not specified'} and the file structure is ${JSON.stringify(fileStructure)}. Reading a file produces a frontend grant request; do not claim access beyond the authorized payload. Edits are proposals and require user approval. Be concise. Current model: ${model}. When the user says check Levity, inspect the configured Levity MCP endpoint first using mcp_tools, then mcp_call as needed. The endpoint is ${MCP_URL}; never tell the user to call Levity MCP or configure it. If MCP exposes a URL or endpoint, use fetch_url or multi_fetch to inspect it further. Use fetch_url for network endpoint tests. JavaScript execution is intentionally restricted to safe expressions; never claim process or filesystem access.` }, ...(Array.isArray(body.messages) ? body.messages : [])]
     for (let round = 0; round < 8; round++) {
       const completionBody = JSON.stringify({ model, messages, tools: toolDefinitions, tool_choice: 'auto', temperature: 0.2, max_tokens: Math.min(Number(body.maxTokens) || 8192, 32768), stream: false })
       let completion: Response | null = null
@@ -96,10 +110,11 @@ export async function POST(request: NextRequest) {
         const retryAfter = Number(completion.headers.get('retry-after'))
         await new Promise((resolve) => setTimeout(resolve, Number.isFinite(retryAfter) ? Math.min(retryAfter * 1000, 5000) : 1000 * (attempt + 1)))
       }
-      if (!completion || !completion.ok) return NextResponse.json({ error: `Hermes error ${completion?.status || 502}`, detail: bounded(await completion?.text() || 'Upstream request was throttled or unavailable.', 4000) }, { status: 502 })
+      if (!completion || !completion.ok) return json({ error: `Hermes error ${completion?.status || 502}`, detail: bounded(await completion?.text() || 'Upstream request was throttled or unavailable.', 4000), statuses }, { status: 502 })
       const data = await completion.json(); const assistant = data.choices?.[0]?.message; if (!assistant) return NextResponse.json({ error: 'Hermes returned no message.' }, { status: 502 })
       messages.push(assistant)
-      if (!assistant.tool_calls?.length) return NextResponse.json({ model, message: assistant, rounds: round + 1 })
+      if (!assistant.tool_calls?.length) return json({ model, message: assistant, rounds: round + 1, statuses })
+      assistant.tool_calls.forEach((call: { function: { name: string } }) => { const status = toolStatus[call.function.name]; if (status) statuses.push(status) })
       const results = await Promise.all(assistant.tool_calls.map(async (call: { id: string; function: { name: string; arguments: string } }) => { let args: Record<string, unknown>; try { args = JSON.parse(call.function.arguments || '{}') } catch { args = {} }; return { role: 'tool', tool_call_id: call.id, name: call.function.name, content: JSON.stringify(await executeTool(call.function.name, args, files)) } }))
       messages.push(...results)
     }

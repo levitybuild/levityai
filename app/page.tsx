@@ -5,6 +5,7 @@ import { Bot, ChevronDown, Code2, FileCode2, FolderOpen, GitBranch, History, Men
 
 type FileItem = { path: string; content: string }
 type Message = { role: 'user' | 'assistant'; content: string; tool?: string }
+type ApiResult = { model?: string; message?: { content?: string; tool_calls?: unknown[] }; error?: string; statuses?: string[] }
 
 const starterFiles: FileItem[] = [
   { path: 'src/App.tsx', content: `export default function App() {\n  return (\n    <main className="app">\n      <h1>Hello from Levity</h1>\n      <p>Start building with your AI pair programmer.</p>\n    </main>\n  )\n}` },
@@ -20,6 +21,7 @@ export default function Page() {
   const [prompt, setPrompt] = useState('')
   const [model, setModel] = useState('loading model…')
   const [thinking, setThinking] = useState(false)
+  const [status, setStatus] = useState('ready')
   const [aiOpen, setAiOpen] = useState(true)
   const [mobilePane, setMobilePane] = useState<'code' | 'preview'>('code')
   const active = useMemo(() => files.find((file) => file.path === activePath)!, [files, activePath])
@@ -31,10 +33,11 @@ export default function Page() {
   function saveDraft() { setFiles((current) => current.map((file) => file.path === activePath ? { ...file, content: draft } : file)) }
   async function sendPrompt() {
     if (!prompt.trim() || thinking) return
-    const text = prompt.trim(); setPrompt(''); setMessages((current) => [...current, { role: 'user', content: text }]); setThinking(true)
+    const text = prompt.trim(); setPrompt(''); setStatus('thinking'); setMessages((current) => [...current, { role: 'user', content: text }]); setThinking(true)
     try {
-      const response = await fetch('/api/chat', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model, files, messages: [{ role: 'user', content: text }] }) })
-      const data = await response.json(); const tool = data.message?.tool_calls?.length ? `${data.message.tool_calls.length} tool call${data.message.tool_calls.length === 1 ? '' : 's'}` : undefined
+      const response = await fetch('/api/chat', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model, files, currentFile: { path: activePath, content: draft }, fileStructure: files.map((file) => file.path), messages: [{ role: 'user', content: text }] }) })
+      const data: ApiResult = await response.json(); const tool = data.message?.tool_calls?.length ? `${data.message.tool_calls.length} tool call${data.message.tool_calls.length === 1 ? '' : 's'}` : undefined
+      setStatus(data.statuses?.at(-1) || 'ready')
       setMessages((current) => [...current, { role: 'assistant', content: data.message?.content || data.error || 'No response received.', tool }])
     } catch { setMessages((current) => [...current, { role: 'assistant', content: 'Network unavailable. The editor is still available offline.' }]) } finally { setThinking(false) }
   }
@@ -52,7 +55,7 @@ export default function Page() {
         <div className="code-editor"><div className="line-numbers">{draft.split('\n').map((_, index) => <span key={index}>{index + 1}</span>)}</div><textarea aria-label="Code editor" spellCheck={false} value={draft} onChange={(event) => setDraft(event.target.value)} /></div>
         <div className="preview-panel"><div className="panel-toolbar"><div className="panel-title"><Play size={14} /> Live preview <span className="live-dot" /></div><div className="preview-tools"><span>Desktop</span><button aria-label="Refresh preview"><RefreshCw size={14} /></button><button aria-label="Open preview"><Code2 size={14} /></button></div></div><div className="preview-canvas"><div className="preview-card"><div className="preview-logo"><Sparkles size={18} /></div><h2>Preview is ready</h2><p>Your authorized project will render here.</p><button onClick={() => setPrompt('Read the selected file and improve the preview')}>Ask Levity to build <Wand2 size={14} /></button></div></div></div>
       </section>
-      {aiOpen ? <aside className="ai-panel"><div className="ai-header"><div><div className="ai-title"><Bot size={17} /> Levity AI</div><div className="ai-model"><span className="status-dot" /> {model}</div></div><button className="icon-button" onClick={() => setAiOpen(false)} aria-label="Close AI panel"><X size={16} /></button></div><div className="chat-scroll">{messages.map((message, index) => <div className={`message ${message.role}`} key={index}>{message.role === 'assistant' && <div className="message-avatar"><Sparkles size={13} /></div>}<div className="message-body"><p>{message.content}</p>{message.tool && <div className="tool-pill"><Terminal size={12} /> {message.tool}</div>}</div></div>)}{thinking && <div className="message assistant"><div className="message-avatar"><Sparkles size={13} /></div><div className="thinking"><i /><i /><i /></div></div>}</div><div className="prompt-area"><div className="prompt-box"><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && event.keyCode !== 229) { event.preventDefault(); sendPrompt() } }} placeholder="Ask Levity to build…" /><button onClick={sendPrompt} disabled={!prompt.trim() || thinking} aria-label="Send prompt"><Send size={16} /></button></div><div className="prompt-meta"><span><span className="key">⌘</span> Enter to send</span><span>Files are authorized locally</span></div></div></aside> : <button className="ai-collapsed" onClick={() => setAiOpen(true)}><Bot size={16} /> AI</button>}
+      {aiOpen ? <aside className="ai-panel"><div className="ai-header"><div><div className="ai-title"><Bot size={17} /> Levity AI</div><div className="ai-model"><span className="status-dot" /> {model} · {thinking ? status : 'ready'}</div></div><button className="icon-button" onClick={() => setAiOpen(false)} aria-label="Close AI panel"><X size={16} /></button></div><div className="chat-scroll">{messages.map((message, index) => <div className={`message ${message.role}`} key={index}>{message.role === 'assistant' && <div className="message-avatar"><Sparkles size={13} /></div>}<div className="message-body"><p>{message.content}</p>{message.tool && <div className="tool-pill"><Terminal size={12} /> {message.tool}</div>}</div></div>)}{thinking && <div className="message assistant"><div className="message-avatar"><Sparkles size={13} /></div><div className="thinking"><i /><i /><i /></div></div>}</div><div className="prompt-area"><div className="prompt-box"><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && event.keyCode !== 229) { event.preventDefault(); sendPrompt() } }} placeholder="Ask Levity to build…" /><button onClick={sendPrompt} disabled={!prompt.trim() || thinking} aria-label="Send prompt"><Send size={16} /></button></div><div className="prompt-meta"><span><span className="key">⌘</span> Enter to send</span><span>Files are authorized locally</span></div></div></aside> : <button className="ai-collapsed" onClick={() => setAiOpen(true)}><Bot size={16} /> AI</button>}
     </div>
   </main>
 }
