@@ -507,3 +507,95 @@ In a real implementation, preserve the conversation messages and add a loop guar
 - The API's JavaScript tool has bounded network access through its provided `fetch`; it does not have filesystem or process access.
 
 The browser-facing implementation in this project is `app/page.tsx`. The server contract is `app/api/chat/route.ts`. This page is the canonical, untruncated integration reference: **`/docs`**.
+
+## 12. Image viewing and Qwen vision models
+
+The API accepts up to eight images per request. Images are attached to the final user message and are passed to the selected Hermes/Unturf model using the OpenAI-compatible multimodal format. Use an HTTPS image URL or a base64 image payload. The model must support vision; discover available models with `GET /api/chat` and choose the Qwen vision model exposed by your Hermes account (model IDs can change).
+
+```js
+async function inspectImage({ prompt, imageUrl, currentFile, fileTree }) {
+  const response = await fetch('https://your-domain.example/api/chat', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      model: 'use-the-qwen-vision-id-from-get-api-chat',
+      currentFile,
+      fileStructure: fileTree,
+      files: [currentFile],
+      images: [{ url: imageUrl, detail: 'auto' }],
+      messages: [{ role: 'user', content: prompt }],
+    }),
+  })
+  if (!response.ok) throw new Error(await response.text())
+  return response.json()
+}
+
+const result = await inspectImage({
+  prompt: 'Read this screenshot. Identify the visible error and tell me which UI file should change.',
+  imageUrl: 'https://example.com/screenshot.png',
+  currentFile: { path: 'src/App.tsx', content: appSource },
+  fileTree: ['src/App.tsx', 'src/styles.css'],
+})
+console.log(result.message.content)
+```
+
+For an uploaded image, convert the `File` to base64 without the `data:` prefix and send its MIME type. The API builds the data URL server-side; it does not expose the image to the browser or save it.
+
+```js
+function fileToImageInput(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve({
+      base64: String(reader.result).split(',')[1],
+      mimeType: file.type || 'image/png',
+      detail: 'auto',
+    })
+    reader.onerror = reject
+    reader.readAsDataURL(file)
+  })
+}
+
+const image = await fileToImageInput(document.querySelector('#screenshot').files[0])
+const result = await fetch('https://your-domain.example/api/chat', {
+  method: 'POST',
+  headers: { 'content-type': 'application/json' },
+  body: JSON.stringify({
+    images: [image],
+    currentFile: { path: 'src/App.tsx', content: appSource },
+    fileStructure: ['src/App.tsx', 'src/styles.css'],
+    files: [{ path: 'src/App.tsx', content: appSource }],
+    messages: [{ role: 'user', content: 'Compare this screenshot with the current UI and propose exact edits.' }],
+  }),
+}).then((response) => response.json())
+```
+
+Base64 payloads are capped at approximately 12 MB per image. Validate file type and size in your frontend before sending. Never send secrets or private image URLs unless your upstream model is authorized to receive them. If the chosen model does not support vision, the API will return the provider error; retry with a vision-capable Qwen model from the discovery response.
+
+## 13. Counting context before sending
+
+The API returns `context.estimatedTokens`, an inexpensive estimate based on serialized request messages, and `usage.prompt_tokens` when Hermes/model usage is available. The estimate is not a billing or tokenizer-exact count. For client-side previews, use the same conservative four-characters-per-token estimate and include image overhead as unknown because image tokenization depends on the model and dimensions.
+
+```js
+function estimateRequestContext({ messages, currentFile, files = [], images = [] }) {
+  const text = JSON.stringify({ messages, currentFile, files })
+  return {
+    characters: text.length,
+    estimatedTokens: Math.ceil(text.length / 4),
+    imageCount: images.length,
+    imageTokens: null,
+    note: 'Image tokens depend on the selected vision model; confirm with usage.prompt_tokens.',
+  }
+}
+
+const contextPreview = estimateRequestContext({ messages, currentFile, files, images })
+console.log(`About to send roughly ${contextPreview.estimatedTokens} text tokens and ${contextPreview.imageCount} image(s)`)
+```
+
+After the request, prefer the provider measurement when present:
+
+```js
+const exactOrBestAvailable = result.usage?.prompt_tokens ?? result.context?.estimatedTokens
+setContextLabel(`${exactOrBestAvailable} input tokens`)
+```
+
+The response still uses the normal `message`, `statuses`, `structuredEdits`, `fileOperations`, and `accessRequests` contract. Images are input only; they do not change how your frontend grants file reads or applies write operations.

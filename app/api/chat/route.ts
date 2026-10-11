@@ -5,7 +5,8 @@ const MCP_URL = process.env.LEVITY_MCP_URL || 'https://api.levity.click/mcp'
 
 type WorkspaceFile = { path: string; content: string }
 type FileOperation = { type: string; path?: string; destination?: string; content?: string; source?: string; requiresApproval?: boolean; risk?: 'low' | 'medium' | 'high' }
-type ChatMessage = { role: string; content?: string; tool_calls?: unknown[]; tool_call_id?: string; name?: string }
+type ImageInput = { url?: string; base64?: string; mimeType?: string; detail?: 'low' | 'high' | 'auto' }
+type ChatMessage = { role: string; content?: string | Array<{ type: string; text?: string; image_url?: { url: string; detail?: string } }>; tool_calls?: unknown[]; tool_call_id?: string; name?: string }
 type ApprovalPolicy = { mode?: 'auto' | 'approval'; allow?: string[]; deny?: string[]; requireApprovalFor?: string[] }
 
 const writeOperations = ['find_replace', 'diff', 'create', 'create_folder', 'clear', 'duplicate', 'move', 'move_folder', 'delete']
@@ -39,6 +40,19 @@ const toolDefinitions = [
 
 function safePath(file: string, files: WorkspaceFile[]) { return files.find((item) => item.path === file) }
 function bounded(value: string, max = 12000) { return value.length > max ? `${value.slice(0, max)}\n… truncated` : value }
+function imagePart(image: ImageInput) {
+  if (typeof image.url === 'string' && /^https?:\/\//i.test(image.url)) return { type: 'image_url', image_url: { url: image.url, detail: image.detail || 'auto' } }
+  if (typeof image.base64 === 'string' && image.base64.length > 0 && image.base64.length <= 12_000_000) {
+    const mimeType = typeof image.mimeType === 'string' && /^image\/[a-z0-9.+-]+$/i.test(image.mimeType) ? image.mimeType : 'image/png'
+    const dataUrl = image.base64.startsWith('data:image/') ? image.base64 : `data:${mimeType};base64,${image.base64}`
+    return { type: 'image_url', image_url: { url: dataUrl, detail: image.detail || 'auto' } }
+  }
+  return null
+}
+function estimateContext(messages: ChatMessage[]) {
+  const characters = JSON.stringify(messages).length
+  return { characters, estimatedTokens: Math.ceil(characters / 4), note: 'Estimate only; use usage.prompt_tokens when returned by the model.' }
+}
 function corsHeaders() { return { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET,POST,OPTIONS', 'access-control-allow-headers': 'content-type, authorization' } }
 function json(data: unknown, init?: ResponseInit) { return NextResponse.json(data, { ...init, headers: { ...corsHeaders(), ...(init?.headers || {}) } }) }
 function eventStream(data: unknown) {
@@ -135,17 +149,28 @@ export async function POST(request: NextRequest) {
     const fileOperations: FileOperation[] = []
     const accessRequests: unknown[] = []
   try {
-    const body = await request.json(); const files: WorkspaceFile[] = Array.isArray(body.files) ? body.files.filter((file: WorkspaceFile) => file && typeof file.path === 'string' && typeof file.content === 'string').slice(0, 200) : []
-    const currentFile = body.currentFile && typeof body.currentFile === 'object' && typeof body.currentFile.path === 'string' ? body.currentFile.path : typeof body.currentFile === 'string' ? body.currentFile : ''
+    const body = await request.json(); const providedFiles: WorkspaceFile[] = Array.isArray(body.files) ? body.files.filter((file: WorkspaceFile) => file && typeof file.path === 'string' && typeof file.content === 'string').slice(0, 200) : []
+    const currentFileInput = body.currentFile && typeof body.currentFile === 'object' ? body.currentFile as { path?: unknown; content?: unknown } : null
+    const currentFile = currentFileInput && typeof currentFileInput.path === 'string' ? currentFileInput.path : typeof body.currentFile === 'string' ? body.currentFile : ''
+    const files: WorkspaceFile[] = currentFileInput && typeof currentFileInput.path === 'string' && typeof currentFileInput.content === 'string' && !providedFiles.some((file) => file.path === currentFileInput.path) ? [...providedFiles, { path: currentFileInput.path, content: currentFileInput.content }] : providedFiles
     const autoReplace = body.autoReplace === true
     const approvalPolicy: ApprovalPolicy = body.approvalPolicy && typeof body.approvalPolicy === 'object' ? body.approvalPolicy : {}
     const stream = body.stream === true
     const fileStructure = Array.isArray(body.fileStructure) ? body.fileStructure.filter((value: unknown): value is string => typeof value === 'string').slice(0, 500) : files.map((file) => file.path)
+    const images = Array.isArray(body.images) ? body.images.map((image: ImageInput) => imagePart(image)).filter(Boolean).slice(0, 8) : []
     statuses.push('reading current file and file structure')
     const requestedModel = typeof body.model === 'string' && body.model !== 'loading model…' && body.model !== 'Hermes model unavailable' && body.model !== 'offline' ? body.model : null
     const model = requestedModel || await discoverModel()
     if (!model) return json({ error: 'Hermes did not return an available model.', statuses }, { status: 503 })
-    const messages: ChatMessage[] = [{ role: 'system', content: `You are Levity AI, a focused coding agent. All tool calls happen on the API, never in the frontend. Workspace access is limited to the files provided by the frontend. The current file is ${currentFile || 'not specified'} and the file structure is ${JSON.stringify(fileStructure)}. Reading a file produces a frontend grant request; do not claim access beyond the authorized payload. Edits and file operations are proposals. When autoReplace is true, the frontend may apply every returned write operation without an additional confirmation; when false, the frontend must request approval. Use delete_file, clear_file, create_file, create_folder, move_file, move_folder, and duplicate_file for workspace mutations. Be concise. Current model: ${model}. When the user says check Levity, inspect the configured Levity MCP endpoint first using mcp_tools, then mcp_call as needed. The endpoint is ${MCP_URL}; never tell the user to call Levity MCP or configure it. If MCP exposes a URL or endpoint, use fetch_url or multi_fetch to inspect it further. Use fetch_url for network endpoint tests. JavaScript execution is intentionally restricted to safe expressions; never claim process or filesystem access.` }, ...(Array.isArray(body.messages) ? body.messages : [])]
+    const userMessages = Array.isArray(body.messages) ? body.messages : []
+    const lastUserIndex = userMessages.map((message: ChatMessage) => message?.role).lastIndexOf('user')
+    if (images.length > 0 && lastUserIndex >= 0) {
+      const original = userMessages[lastUserIndex] as ChatMessage
+      const text = typeof original.content === 'string' ? original.content : ''
+      userMessages[lastUserIndex] = { ...original, content: [{ type: 'text', text }, ...images] }
+    }
+    const messages: ChatMessage[] = [{ role: 'system', content: `You are Levity AI, a focused coding agent. All tool calls happen on the API, never in the frontend. Workspace access is limited to the files provided by the frontend. The current file is ${currentFile || 'not specified'} and the file structure is ${JSON.stringify(fileStructure)}. Reading a file produces a frontend grant request; do not claim access beyond the authorized payload. Edits and file operations are proposals. When autoReplace is true, the frontend may apply every returned write operation without an additional confirmation; when false, the frontend must request approval. Use delete_file, clear_file, create_file, create_folder, move_file, move_folder, and duplicate_file for workspace mutations. You can inspect attached images and describe visible UI, errors, diagrams, or screenshots. Be concise. Current model: ${model}. When the user says check Levity, inspect the configured Levity MCP endpoint first using mcp_tools, then mcp_call as needed. The endpoint is ${MCP_URL}; never tell the user to call Levity MCP or configure it. If MCP exposes a URL or endpoint, use fetch_url or multi_fetch to inspect it further. Use fetch_url for network endpoint tests. JavaScript execution is intentionally restricted to safe expressions; never claim process or filesystem access.` }, ...userMessages]
+    const contextEstimate = estimateContext(messages)
     for (let round = 0; round < 8; round++) {
       const completionBody = JSON.stringify({ model, messages, tools: toolDefinitions, tool_choice: 'auto', temperature: 0.2, max_tokens: Math.min(Number(body.maxTokens) || 8192, 32768), stream: false })
       let completion: Response | null = null
@@ -159,7 +184,7 @@ export async function POST(request: NextRequest) {
       const data = await completion.json(); const assistant = data.choices?.[0]?.message; if (!assistant) return NextResponse.json({ error: 'Hermes returned no message.' }, { status: 502 })
       messages.push(assistant)
       if (!assistant.tool_calls?.length) {
-        const result = { model, autoReplace, approvalPolicy, message: assistant, rounds: round + 1, statuses, structuredEdits, fileOperations, accessRequests }
+        const result = { model, autoReplace, approvalPolicy, message: assistant, rounds: round + 1, statuses: [...statuses, 'ready'], structuredEdits, fileOperations, accessRequests, context: contextEstimate, usage: data.usage || null }
         return stream ? eventStream(result) : json(result)
       }
       assistant.tool_calls.forEach((call: { function: { name: string } }) => { const status = toolStatus[call.function.name]; if (status) statuses.push(status) })
